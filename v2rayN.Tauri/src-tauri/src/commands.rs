@@ -3,7 +3,7 @@ use crate::{
     domain,
     models::{
         AppConfig, AppStatus, ClashConnection, ClashProxyGroup, CoreAssetStatus, CoreType,
-        ProxyProbe, RunningStatus, Subscription,
+        ClashProxyProvider, ProxyProbe, RoutingItem, RoutingRule, RunningStatus, Subscription,
     },
     network_probe,
     system_proxy,
@@ -173,8 +173,177 @@ pub fn get_app_status(app: AppHandle, state: State<'_, SharedState>) -> Result<A
 
 #[tauri::command]
 pub fn save_app_config(config: AppConfig, state: State<'_, SharedState>) -> Result<AppConfig, String> {
+    let mut config = config;
+    domain::ensure_routing_items(&mut config.routing);
     state.store.save(&config).map_err(error_to_string)?;
     state.store.load().map_err(error_to_string)
+}
+
+#[tauri::command]
+pub fn initialize_builtin_routing(advanced_only: bool, state: State<'_, SharedState>) -> Result<AppConfig, String> {
+    let mut config = state.store.load().map_err(error_to_string)?;
+    if advanced_only {
+        let template = crate::models::RoutingTemplate {
+            version: "V4".into(),
+            routing_items: domain::builtin_routing_items(),
+        };
+        let _ = domain::apply_routing_template(&mut config.routing, template, true).map_err(error_to_string)?;
+    } else {
+        config.routing.items = domain::builtin_routing_items();
+        domain::ensure_routing_items(&mut config.routing);
+    }
+    state.store.save(&config).map_err(error_to_string)?;
+    Ok(config)
+}
+
+#[tauri::command]
+pub fn import_routing_template_url(
+    url: String,
+    advanced_only: bool,
+    state: State<'_, SharedState>,
+) -> Result<AppConfig, String> {
+    let mut config = state.store.load().map_err(error_to_string)?;
+    let template_raw = download_text(&url, "v2rayN-tauri", None).map_err(error_to_string)?;
+    let template = domain::routing_template_from_raw(&template_raw).map_err(error_to_string)?;
+    let _ = domain::apply_routing_template(&mut config.routing, template, advanced_only).map_err(error_to_string)?;
+    config.routing.template_source_url = Some(url);
+    state.store.save(&config).map_err(error_to_string)?;
+    Ok(config)
+}
+
+#[tauri::command]
+pub fn save_routing_item(routing_item: RoutingItem, state: State<'_, SharedState>) -> Result<AppConfig, String> {
+    let mut config = state.store.load().map_err(error_to_string)?;
+    let mut routing_item = routing_item;
+    if routing_item.id.is_empty() {
+        routing_item.id = crate::models::new_id("routing");
+    }
+    for rule in &mut routing_item.rule_set {
+        if rule.id.is_empty() {
+            rule.id = crate::models::new_id("routing-rule");
+        }
+    }
+    routing_item.rule_num = routing_item.rule_set.len();
+
+    if let Some(existing) = config.routing.items.iter_mut().find(|item| item.id == routing_item.id) {
+        *existing = routing_item.clone();
+    } else {
+        routing_item.sort = config.routing.items.iter().map(|item| item.sort).max().unwrap_or(0) + 1;
+        config.routing.items.push(routing_item.clone());
+    }
+    if routing_item.is_active {
+        domain::set_active_routing_item(&mut config.routing, &routing_item.id);
+    } else {
+        domain::ensure_routing_items(&mut config.routing);
+    }
+    state.store.save(&config).map_err(error_to_string)?;
+    Ok(config)
+}
+
+#[tauri::command]
+pub fn remove_routing_item(routing_id: String, state: State<'_, SharedState>) -> Result<AppConfig, String> {
+    let mut config = state.store.load().map_err(error_to_string)?;
+    config.routing.items.retain(|item| item.id != routing_id);
+    domain::ensure_routing_items(&mut config.routing);
+    state.store.save(&config).map_err(error_to_string)?;
+    Ok(config)
+}
+
+#[tauri::command]
+pub fn set_default_routing_item(routing_id: String, state: State<'_, SharedState>) -> Result<AppConfig, String> {
+    let mut config = state.store.load().map_err(error_to_string)?;
+    if !config.routing.items.iter().any(|item| item.id == routing_id) {
+        return Err("未找到路由集".into());
+    }
+    domain::set_active_routing_item(&mut config.routing, &routing_id);
+    state.store.save(&config).map_err(error_to_string)?;
+    Ok(config)
+}
+
+#[tauri::command]
+pub fn import_routing_rules(
+    routing_id: String,
+    raw: String,
+    replace_existing: bool,
+    state: State<'_, SharedState>,
+) -> Result<AppConfig, String> {
+    let mut config = state.store.load().map_err(error_to_string)?;
+    let imported_rules = domain::parse_routing_rules_json(&raw).map_err(error_to_string)?;
+    let item = config
+        .routing
+        .items
+        .iter_mut()
+        .find(|item| item.id == routing_id)
+        .ok_or_else(|| "未找到路由集".to_string())?;
+    if replace_existing {
+        item.rule_set = imported_rules;
+    } else {
+        item.rule_set.extend(imported_rules);
+    }
+    item.rule_num = item.rule_set.len();
+    state.store.save(&config).map_err(error_to_string)?;
+    Ok(config)
+}
+
+#[tauri::command]
+pub fn export_routing_rules(
+    routing_id: String,
+    rule_ids: Option<Vec<String>>,
+    state: State<'_, SharedState>,
+) -> Result<String, String> {
+    let config = state.store.load().map_err(error_to_string)?;
+    let item = config
+        .routing
+        .items
+        .iter()
+        .find(|item| item.id == routing_id)
+        .ok_or_else(|| "未找到路由集".to_string())?;
+    let rules: Vec<RoutingRule> = match rule_ids {
+        Some(ids) if !ids.is_empty() => item
+            .rule_set
+            .iter()
+            .filter(|rule| ids.iter().any(|id| id == &rule.id))
+            .cloned()
+            .collect(),
+        _ => item.rule_set.clone(),
+    };
+    domain::export_routing_rules_json(&rules).map_err(error_to_string)
+}
+
+#[tauri::command]
+pub fn move_routing_rule(
+    routing_id: String,
+    rule_id: String,
+    direction: String,
+    state: State<'_, SharedState>,
+) -> Result<AppConfig, String> {
+    let mut config = state.store.load().map_err(error_to_string)?;
+    let item = config
+        .routing
+        .items
+        .iter_mut()
+        .find(|item| item.id == routing_id)
+        .ok_or_else(|| "未找到路由集".to_string())?;
+    let index = item
+        .rule_set
+        .iter()
+        .position(|rule| rule.id == rule_id)
+        .ok_or_else(|| "未找到路由规则".to_string())?;
+
+    let new_index = match direction.as_str() {
+        "top" => 0,
+        "up" => index.saturating_sub(1),
+        "down" => (index + 1).min(item.rule_set.len().saturating_sub(1)),
+        "bottom" => item.rule_set.len().saturating_sub(1),
+        _ => return Err("不支持的移动方向".into()),
+    };
+    if index != new_index {
+        let rule = item.rule_set.remove(index);
+        item.rule_set.insert(new_index, rule);
+    }
+    item.rule_num = item.rule_set.len();
+    state.store.save(&config).map_err(error_to_string)?;
+    Ok(config)
 }
 
 #[tauri::command]
@@ -540,33 +709,138 @@ pub fn test_clash_proxy_delay(group_name: String, state: State<'_, SharedState>)
     clash_api_delay_test(&config, &group_name).map_err(error_to_string)
 }
 
+#[tauri::command]
+pub fn get_clash_proxy_providers(state: State<'_, SharedState>) -> Result<Vec<ClashProxyProvider>, String> {
+    let config = state.store.load().map_err(error_to_string)?;
+    let value = clash_api_get(&config, "/providers/proxies").map_err(error_to_string)?;
+    let mut providers = vec![];
+    if let Some(items) = value.get("providers").and_then(Value::as_object) {
+        for (name, provider) in items {
+            providers.push(ClashProxyProvider {
+                name: name.clone(),
+                provider_type: provider
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Unknown")
+                    .to_string(),
+                vehicle_type: provider.get("vehicleType").and_then(Value::as_str).map(str::to_string),
+                updated_at: provider.get("updatedAt").and_then(Value::as_str).map(str::to_string),
+                proxies: provider
+                    .get("proxies")
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| item.get("name").and_then(Value::as_str))
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default(),
+            });
+        }
+    }
+    Ok(providers)
+}
+
+#[tauri::command]
+pub fn update_clash_rule_mode(rule_mode: String, state: State<'_, SharedState>) -> Result<(), String> {
+    let mut config = state.store.load().map_err(error_to_string)?;
+    clash_api_patch(&config, "/configs", json!({ "mode": rule_mode })).map_err(error_to_string)?;
+    config.clash.rule_mode = rule_mode;
+    state.store.save(&config).map_err(error_to_string)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn reload_clash_config(state: State<'_, SharedState>) -> Result<(), String> {
+    let config = state.store.load().map_err(error_to_string)?;
+    let path = state.runtime.status().config_path.ok_or_else(|| "当前没有运行中的 mihomo 配置".to_string())?;
+    clash_api_put_with_query(&config, "/configs?force=true", json!({ "path": path })).map_err(error_to_string)
+}
+
+#[tauri::command]
+pub fn close_clash_connection(connection_id: String, state: State<'_, SharedState>) -> Result<(), String> {
+    let config = state.store.load().map_err(error_to_string)?;
+    let path = if connection_id.is_empty() {
+        "/connections".to_string()
+    } else {
+        format!("/connections/{}", urlencoding::encode(&connection_id))
+    };
+    clash_api_delete(&config, &path).map_err(error_to_string)
+}
+
+#[tauri::command]
+pub fn refresh_clash_proxy_provider(provider_name: String, state: State<'_, SharedState>) -> Result<(), String> {
+    let config = state.store.load().map_err(error_to_string)?;
+    clash_api_put(
+        &config,
+        &format!("/providers/proxies/{}/healthcheck", urlencoding::encode(&provider_name)),
+        json!({}),
+    )
+    .map_err(error_to_string)
+}
+
 fn clash_api_get(config: &AppConfig, path: &str) -> Result<Value> {
     let client = build_client("v2rayN-tauri", None)?;
     let url = format!("http://127.0.0.1:{}{}", config.clash.external_controller_port, path);
-    let response = client.get(url).send()?.error_for_status()?;
+    let response = clash_request(client.get(url), config)?.error_for_status()?;
     Ok(response.json()?)
 }
 
 fn clash_api_put(config: &AppConfig, path: &str, body: Value) -> Result<()> {
     let client = build_client("v2rayN-tauri", None)?;
     let url = format!("http://127.0.0.1:{}{}", config.clash.external_controller_port, path);
-    client.put(url).json(&body).send()?.error_for_status()?;
+    clash_request(client.put(url).json(&body), config)?.error_for_status()?;
+    Ok(())
+}
+
+fn clash_api_put_with_query(config: &AppConfig, path: &str, body: Value) -> Result<()> {
+    let client = build_client("v2rayN-tauri", None)?;
+    let url = format!("http://127.0.0.1:{}{}", config.clash.external_controller_port, path);
+    clash_request(client.put(url).json(&body), config)?.error_for_status()?;
+    Ok(())
+}
+
+fn clash_api_patch(config: &AppConfig, path: &str, body: Value) -> Result<()> {
+    let client = build_client("v2rayN-tauri", None)?;
+    let url = format!("http://127.0.0.1:{}{}", config.clash.external_controller_port, path);
+    clash_request(client.patch(url).json(&body), config)?.error_for_status()?;
+    Ok(())
+}
+
+fn clash_api_delete(config: &AppConfig, path: &str) -> Result<()> {
+    let client = build_client("v2rayN-tauri", None)?;
+    let url = format!("http://127.0.0.1:{}{}", config.clash.external_controller_port, path);
+    clash_request(client.delete(url), config)?.error_for_status()?;
     Ok(())
 }
 
 fn clash_api_delay_test(config: &AppConfig, group_name: &str) -> Result<u64> {
     let client = build_client("v2rayN-tauri", None)?;
     let url = format!(
-        "http://127.0.0.1:{}/proxies/{}/delay?timeout=10000&url=https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204",
+        "http://127.0.0.1:{}/proxies/{}/delay?timeout=10000&url={}",
         config.clash.external_controller_port,
-        urlencoding::encode(group_name)
+        urlencoding::encode(group_name),
+        urlencoding::encode(&config.clash.proxies_auto_delay_test_url)
     );
-    let response = client.get(url).send()?.error_for_status()?;
+    let response = clash_request(client.get(url), config)?.error_for_status()?;
     let payload: Value = response.json()?;
     payload
         .get("delay")
         .and_then(Value::as_u64)
         .context("测速结果缺少 delay 字段")
+}
+
+fn clash_request(
+    request: reqwest::blocking::RequestBuilder,
+    config: &AppConfig,
+) -> Result<reqwest::blocking::Response> {
+    let request = if let Some(secret) = config.clash.secret.as_ref().filter(|value| !value.is_empty()) {
+        request.header("Authorization", format!("Bearer {secret}"))
+    } else {
+        request
+    };
+    Ok(request.send()?)
 }
 
 fn latest_delay_ms(proxy: Option<&serde_json::Map<String, Value>>) -> Option<u64> {

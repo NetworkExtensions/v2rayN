@@ -13,6 +13,7 @@ export type ProfileProtocol =
 export type ProfileConfigType = 'native' | 'external'
 export type ExternalConfigFormat = 'sing_box' | 'xray' | 'clash'
 export type MuxOverride = 'follow_global' | 'force_enable' | 'force_disable'
+export type RoutingRuleType = 'all' | 'routing' | 'dns'
 
 export interface Profile {
   id: string
@@ -84,6 +85,48 @@ export interface DnsSettings {
 
 export interface RoutingSettings {
   mode: string
+  domain_strategy: string
+  domain_strategy_4_singbox: string
+  routing_index_id?: string | null
+  template_source_url?: string | null
+  items: RoutingItem[]
+}
+
+export interface RoutingRule {
+  id: string
+  rule_type: RoutingRuleType
+  enabled: boolean
+  remarks?: string | null
+  type_name?: string | null
+  port?: string | null
+  network?: string | null
+  inbound_tag: string[]
+  outbound_tag?: string | null
+  ip: string[]
+  domain: string[]
+  protocol: string[]
+  process: string[]
+}
+
+export interface RoutingItem {
+  id: string
+  remarks: string
+  url: string
+  rule_set: RoutingRule[]
+  rule_num: number
+  enabled: boolean
+  locked: boolean
+  custom_icon?: string | null
+  custom_ruleset_path_4_singbox?: string | null
+  domain_strategy?: string | null
+  domain_strategy_4_singbox?: string | null
+  sort: number
+  is_active: boolean
+}
+
+export interface RoutingTemplate {
+  version: string
+  routing_items: RoutingItem[]
 }
 
 export interface MuxSettings {
@@ -99,9 +142,18 @@ export interface MuxSettings {
 export interface ClashSettings {
   external_controller_port: number
   enable_ipv6: boolean
+  allow_lan: boolean
+  bind_address: string
+  rule_mode: string
+  secret?: string | null
+  enable_mixin_content: boolean
+  mixin_content: string
   proxies_sorting: number
   proxies_auto_refresh: boolean
   proxies_auto_delay_test_interval: number
+  proxies_auto_delay_test_url: string
+  providers_auto_refresh: boolean
+  providers_refresh_interval: number
   connections_auto_refresh: boolean
   connections_refresh_interval: number
 }
@@ -198,4 +250,12 @@ export interface ClashConnection {
   host?: string | null
   destination?: string | null
   start?: string | null
+}
+
+export interface ClashProxyProvider {
+  name: string
+  provider_type: string
+  vehicle_type?: string | null
+  updated_at?: string | null
+  proxies: string[]
 }

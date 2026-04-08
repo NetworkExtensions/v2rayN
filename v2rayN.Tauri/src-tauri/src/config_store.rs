@@ -1,7 +1,11 @@
-use crate::models::{AppConfig, AppPaths};
+use crate::models::{AppConfig, AppPaths, RoutingItem, RoutingRule};
 use anyhow::{Context, Result};
 use std::{fs, path::{Path, PathBuf}};
 use tauri::{AppHandle, Manager};
+
+const BUILTIN_ROUTE_WHITE: &str = include_str!("../../../v2rayN/ServiceLib/Sample/custom_routing_white");
+const BUILTIN_ROUTE_BLACK: &str = include_str!("../../../v2rayN/ServiceLib/Sample/custom_routing_black");
+const BUILTIN_ROUTE_GLOBAL: &str = include_str!("../../../v2rayN/ServiceLib/Sample/custom_routing_global");
 
 #[derive(Debug, Clone)]
 pub struct ConfigStore {
@@ -141,4 +145,100 @@ fn normalize_config(config: &mut AppConfig) {
     if config.clash.external_controller_port == 0 {
         config.clash.external_controller_port = config.proxy.socks_port.saturating_add(5);
     }
+
+    if config.clash.bind_address.is_empty() {
+        config.clash.bind_address = "127.0.0.1".into();
+    }
+
+    if config.clash.rule_mode.is_empty() {
+        config.clash.rule_mode = "rule".into();
+    }
+
+    if config.clash.proxies_auto_delay_test_url.is_empty() {
+        config.clash.proxies_auto_delay_test_url = "https://www.gstatic.com/generate_204".into();
+    }
+
+    if config.clash.providers_refresh_interval == 0 {
+        config.clash.providers_refresh_interval = 10;
+    }
+
+    if config.routing.domain_strategy.is_empty() {
+        config.routing.domain_strategy = "AsIs".into();
+    }
+
+    normalize_routing_items(config);
+}
+
+fn normalize_routing_items(config: &mut AppConfig) {
+    if config.routing.items.is_empty() {
+        config.routing.items = builtin_routing_items();
+    }
+
+    for (index, item) in config.routing.items.iter_mut().enumerate() {
+        if item.id.is_empty() {
+            item.id = crate::models::new_id("routing");
+        }
+        if item.sort == 0 {
+            item.sort = index + 1;
+        }
+        if item.rule_set.iter().any(|rule| rule.id.is_empty()) {
+            for rule in &mut item.rule_set {
+                if rule.id.is_empty() {
+                    rule.id = crate::models::new_id("routing-rule");
+                }
+            }
+        }
+        item.rule_num = item.rule_set.len();
+    }
+
+    let active_id = config
+        .routing
+        .items
+        .iter()
+        .find(|item| item.is_active)
+        .map(|item| item.id.clone())
+        .or_else(|| config.routing.routing_index_id.clone())
+        .or_else(|| config.routing.items.first().map(|item| item.id.clone()));
+
+    for item in &mut config.routing.items {
+        item.is_active = Some(&item.id) == active_id.as_ref();
+    }
+    config.routing.routing_index_id = active_id;
+}
+
+fn builtin_routing_items() -> Vec<RoutingItem> {
+    [
+        ("V4-绕过大陆(Whitelist)", BUILTIN_ROUTE_WHITE),
+        ("V4-黑名单(Blacklist)", BUILTIN_ROUTE_BLACK),
+        ("V4-全局(Global)", BUILTIN_ROUTE_GLOBAL),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, (remarks, raw_rules))| {
+        let rule_set = serde_json::from_str::<Vec<RoutingRule>>(raw_rules).unwrap_or_default();
+        RoutingItem {
+            id: crate::models::new_id("routing"),
+            remarks: remarks.into(),
+            url: String::new(),
+            rule_set: rule_set
+                .into_iter()
+                .map(|mut rule| {
+                    if rule.id.is_empty() {
+                        rule.id = crate::models::new_id("routing-rule");
+                    }
+                    rule
+                })
+                .collect(),
+            rule_num: serde_json::from_str::<Vec<RoutingRule>>(raw_rules).map(|rules| rules.len()).unwrap_or(0),
+            enabled: true,
+            locked: false,
+            custom_icon: None,
+            custom_ruleset_path_4_singbox: None,
+            domain_strategy: None,
+            domain_strategy_4_singbox: None,
+            sort: index + 1,
+            is_active: index == 0,
+        }
+    })
+    .collect()
 }

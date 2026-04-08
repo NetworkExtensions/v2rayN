@@ -7,20 +7,24 @@ import type {
   AppStatus,
   ClashConnection,
   ClashProxyGroup,
+  ClashProxyProvider,
   CoreAssetStatus,
   CoreLogEvent,
   CoreType,
   ImportPreview,
   Profile,
+  RoutingItem,
+  RoutingRule,
   Subscription,
 } from './lib/types'
 
-type TabKey = 'overview' | 'profiles' | 'subscriptions' | 'settings' | 'clash' | 'logs'
+type TabKey = 'overview' | 'profiles' | 'subscriptions' | 'routing' | 'settings' | 'clash' | 'logs'
 
 const tabs: Array<{ key: TabKey; label: string }> = [
   { key: 'overview', label: '总览' },
   { key: 'profiles', label: '节点' },
   { key: 'subscriptions', label: '订阅' },
+  { key: 'routing', label: '路由' },
   { key: 'settings', label: '设置' },
   { key: 'clash', label: 'Clash' },
   { key: 'logs', label: '日志' },
@@ -39,7 +43,12 @@ function App() {
   const [probeLoading, setProbeLoading] = useState(false)
   const [lastImportPreview, setLastImportPreview] = useState<ImportPreview | null>(null)
   const [clashProxyGroups, setClashProxyGroups] = useState<ClashProxyGroup[]>([])
+  const [clashProxyProviders, setClashProxyProviders] = useState<ClashProxyProvider[]>([])
   const [clashConnections, setClashConnections] = useState<ClashConnection[]>([])
+  const [selectedRoutingId, setSelectedRoutingId] = useState<string>('')
+  const [selectedRoutingRuleId, setSelectedRoutingRuleId] = useState<string>('')
+  const [routingTemplateUrlDraft, setRoutingTemplateUrlDraft] = useState('')
+  const [clashConnectionFilter, setClashConnectionFilter] = useState('')
 
   useEffect(() => {
     void loadStatus()
@@ -60,6 +69,14 @@ function App() {
     return config?.profiles.find((profile) => profile.id === selectedProfileId) ?? null
   }, [config, selectedProfileId])
 
+  const selectedRouting = useMemo(() => {
+    return config?.routing.items.find((item) => item.id === selectedRoutingId) ?? null
+  }, [config?.routing.items, selectedRoutingId])
+
+  const selectedRoutingRule = useMemo(() => {
+    return selectedRouting?.rule_set.find((rule) => rule.id === selectedRoutingRuleId) ?? null
+  }, [selectedRouting, selectedRoutingRuleId])
+
   const sortedClashProxyGroups = useMemo(() => {
     const groups = [...clashProxyGroups]
     switch (config?.clash.proxies_sorting) {
@@ -72,11 +89,51 @@ function App() {
     }
   }, [clashProxyGroups, config?.clash.proxies_sorting])
 
+  const filteredClashConnections = useMemo(() => {
+    const keyword = clashConnectionFilter.trim().toLowerCase()
+    if (!keyword) {
+      return clashConnections
+    }
+    return clashConnections.filter((connection) =>
+      [
+        connection.host,
+        connection.destination,
+        connection.rule,
+        connection.chains.join(' '),
+        connection.id,
+      ]
+        .filter(Boolean)
+        .join(' ')
+        .toLowerCase()
+        .includes(keyword),
+    )
+  }, [clashConnectionFilter, clashConnections])
+
   useEffect(() => {
     if (activeTab === 'clash' && status?.runtime.running && status.runtime.core_type === 'mihomo') {
       void refreshClashState()
     }
   }, [activeTab, status?.runtime.running, status?.runtime.core_type])
+
+  useEffect(() => {
+    const nextRoutingId =
+      config?.routing.routing_index_id ??
+      config?.routing.items.find((item) => item.is_active)?.id ??
+      config?.routing.items[0]?.id ??
+      ''
+    setSelectedRoutingId((current) => (current && config?.routing.items.some((item) => item.id === current) ? current : nextRoutingId))
+  }, [config?.routing.items, config?.routing.routing_index_id])
+
+  useEffect(() => {
+    const nextRuleId = selectedRouting?.rule_set[0]?.id ?? ''
+    setSelectedRoutingRuleId((current) =>
+      current && selectedRouting?.rule_set.some((rule) => rule.id === current) ? current : nextRuleId,
+    )
+  }, [selectedRouting])
+
+  useEffect(() => {
+    setRoutingTemplateUrlDraft(config?.routing.template_source_url ?? '')
+  }, [config?.routing.template_source_url])
 
   useEffect(() => {
     if (
@@ -126,6 +183,28 @@ function App() {
     config?.clash.connections_refresh_interval,
   ])
 
+  useEffect(() => {
+    if (
+      activeTab !== 'clash' ||
+      status?.runtime.core_type !== 'mihomo' ||
+      !status?.runtime.running ||
+      !config?.clash.providers_auto_refresh
+    ) {
+      return
+    }
+    const intervalMinutes = Math.max(1, config.clash.providers_refresh_interval)
+    const timer = window.setInterval(() => {
+      void refreshClashProvidersOnly()
+    }, intervalMinutes * 60_000)
+    return () => window.clearInterval(timer)
+  }, [
+    activeTab,
+    status?.runtime.core_type,
+    status?.runtime.running,
+    config?.clash.providers_auto_refresh,
+    config?.clash.providers_refresh_interval,
+  ])
+
   async function loadStatus() {
     try {
       const nextStatus = await desktopApi.getStatus()
@@ -163,8 +242,9 @@ function App() {
   async function refreshClashState(runDelayTest = false) {
     setBusyAction('clash-refresh')
     try {
-      const [groups, connections] = await Promise.all([
+      const [groups, providers, connections] = await Promise.all([
         desktopApi.getClashProxyGroups(),
+        desktopApi.getClashProxyProviders(),
         desktopApi.getClashConnections(),
       ])
       const enrichedGroups = runDelayTest
@@ -180,6 +260,7 @@ function App() {
           )
         : groups
       setClashProxyGroups(enrichedGroups)
+      setClashProxyProviders(providers)
       setClashConnections(connections)
     } catch (error) {
       setMessage(String(error))
@@ -192,6 +273,15 @@ function App() {
     try {
       const connections = await desktopApi.getClashConnections()
       setClashConnections(connections)
+    } catch (error) {
+      setMessage(String(error))
+    }
+  }
+
+  async function refreshClashProvidersOnly() {
+    try {
+      const providers = await desktopApi.getClashProxyProviders()
+      setClashProxyProviders(providers)
     } catch (error) {
       setMessage(String(error))
     }
@@ -449,6 +539,166 @@ function App() {
     } finally {
       setBusyAction(null)
     }
+  }
+
+  async function handleCloseClashConnection(connectionId: string) {
+    setBusyAction(connectionId ? `clash-close-${connectionId}` : 'clash-close-all')
+    try {
+      await desktopApi.closeClashConnection(connectionId)
+      await refreshClashConnectionsOnly()
+      setMessage(connectionId ? '连接已关闭' : '全部连接已关闭')
+    } catch (error) {
+      setMessage(String(error))
+    } finally {
+      setBusyAction(null)
+    }
+  }
+
+  async function handleRefreshClashProvider(providerName: string) {
+    setBusyAction(`clash-provider-${providerName}`)
+    try {
+      await desktopApi.refreshClashProxyProvider(providerName)
+      await refreshClashProvidersOnly()
+      setMessage(`已刷新 provider: ${providerName}`)
+    } catch (error) {
+      setMessage(String(error))
+    } finally {
+      setBusyAction(null)
+    }
+  }
+
+  async function handleReloadClashConfig() {
+    setBusyAction('clash-reload')
+    try {
+      await desktopApi.reloadClashConfig()
+      await refreshClashState()
+      setMessage('Clash 配置已热重载')
+    } catch (error) {
+      setMessage(String(error))
+    } finally {
+      setBusyAction(null)
+    }
+  }
+
+  async function handleUpdateClashRuleMode(ruleMode: string) {
+    setBusyAction('clash-rule-mode')
+    try {
+      await desktopApi.updateClashRuleMode(ruleMode)
+      await refreshClashState()
+      updateConfig((draft) => {
+        draft.clash.rule_mode = ruleMode
+      })
+      setMessage(`Clash 规则模式已切换为 ${ruleMode}`)
+    } catch (error) {
+      setMessage(String(error))
+    } finally {
+      setBusyAction(null)
+    }
+  }
+
+  async function handleInitializeBuiltinRouting(advancedOnly = false) {
+    setBusyAction('routing-init')
+    try {
+      const nextConfig = await desktopApi.initializeBuiltinRouting(advancedOnly)
+      setConfig(nextConfig)
+      setMessage(advancedOnly ? '已追加内置高级路由模板' : '已初始化内置路由模板')
+      setPreview(await desktopApi.generatePreview())
+    } catch (error) {
+      setMessage(String(error))
+    } finally {
+      setBusyAction(null)
+    }
+  }
+
+  async function handleImportRoutingTemplateUrl() {
+    if (!routingTemplateUrlDraft.trim()) {
+      setMessage('请先填写路由模板 URL')
+      return
+    }
+    setBusyAction('routing-template-url')
+    try {
+      const nextConfig = await desktopApi.importRoutingTemplateUrl(routingTemplateUrlDraft.trim(), true)
+      setConfig(nextConfig)
+      setMessage('路由模板已导入')
+      setPreview(await desktopApi.generatePreview())
+    } catch (error) {
+      setMessage(String(error))
+    } finally {
+      setBusyAction(null)
+    }
+  }
+
+  async function handleExportRoutingRules() {
+    if (!selectedRouting) {
+      setMessage('请先选择路由集')
+      return
+    }
+    setBusyAction('routing-export')
+    try {
+      const content = await desktopApi.exportRoutingRules(selectedRouting.id)
+      await navigator.clipboard.writeText(content)
+      setMessage('路由规则 JSON 已复制到剪贴板')
+    } catch (error) {
+      setMessage(String(error))
+    } finally {
+      setBusyAction(null)
+    }
+  }
+
+  function addRoutingItem() {
+    updateConfig((draft) => {
+      const item: RoutingItem = {
+        id: crypto.randomUUID(),
+        remarks: `路由 ${draft.routing.items.length + 1}`,
+        url: '',
+        rule_set: [],
+        rule_num: 0,
+        enabled: true,
+        locked: false,
+        custom_icon: '',
+        custom_ruleset_path_4_singbox: '',
+        domain_strategy: '',
+        domain_strategy_4_singbox: '',
+        sort: draft.routing.items.length + 1,
+        is_active: draft.routing.items.length === 0,
+      }
+      draft.routing.items.push(item)
+      if (item.is_active) {
+        draft.routing.routing_index_id = item.id
+      }
+      setSelectedRoutingId(item.id)
+    })
+  }
+
+  function addRoutingRule() {
+    if (!selectedRouting) {
+      setMessage('请先选择路由集')
+      return
+    }
+    updateConfig((draft) => {
+      const item = draft.routing.items.find((entry) => entry.id === selectedRouting.id)
+      if (!item) {
+        return
+      }
+      const rule: RoutingRule = {
+        id: crypto.randomUUID(),
+        rule_type: 'all',
+        enabled: true,
+        remarks: '新规则',
+        type_name: '',
+        port: '',
+        network: '',
+        inbound_tag: [],
+        outbound_tag: 'proxy',
+        ip: [],
+        domain: [],
+        protocol: [],
+        process: [],
+      }
+      item.rule_set.unshift(rule)
+      item.rule_num = item.rule_set.length
+      setSelectedRoutingRuleId(rule.id)
+    })
   }
 
   if (!config || !status) {
@@ -1150,8 +1400,34 @@ function App() {
                   <Field label="external-controller 端口">
                     <input type="number" value={config.clash.external_controller_port} onChange={(event) => updateConfig((draft) => { draft.clash.external_controller_port = Number(event.target.value) || 0 })} />
                   </Field>
+                  <Field label="bind-address">
+                    <input value={config.clash.bind_address} onChange={(event) => updateConfig((draft) => { draft.clash.bind_address = event.target.value })} />
+                  </Field>
+                  <Field label="allow-lan">
+                    <select value={String(config.clash.allow_lan)} onChange={(event) => updateConfig((draft) => { draft.clash.allow_lan = event.target.value === 'true' })}>
+                      <option value="false">false</option>
+                      <option value="true">true</option>
+                    </select>
+                  </Field>
                   <Field label="启用 IPv6">
                     <select value={String(config.clash.enable_ipv6)} onChange={(event) => updateConfig((draft) => { draft.clash.enable_ipv6 = event.target.value === 'true' })}>
+                      <option value="false">false</option>
+                      <option value="true">true</option>
+                    </select>
+                  </Field>
+                  <Field label="Rule Mode">
+                    <select value={config.clash.rule_mode} onChange={(event) => updateConfig((draft) => { draft.clash.rule_mode = event.target.value })}>
+                      <option value="rule">rule</option>
+                      <option value="global">global</option>
+                      <option value="direct">direct</option>
+                      <option value="unchanged">unchanged</option>
+                    </select>
+                  </Field>
+                  <Field label="secret">
+                    <input value={config.clash.secret ?? ''} onChange={(event) => updateConfig((draft) => { draft.clash.secret = event.target.value })} />
+                  </Field>
+                  <Field label="启用 Mixin">
+                    <select value={String(config.clash.enable_mixin_content)} onChange={(event) => updateConfig((draft) => { draft.clash.enable_mixin_content = event.target.value === 'true' })}>
                       <option value="false">false</option>
                       <option value="true">true</option>
                     </select>
@@ -1172,6 +1448,18 @@ function App() {
                   <Field label="代理组测速间隔（分钟）">
                     <input type="number" value={config.clash.proxies_auto_delay_test_interval} onChange={(event) => updateConfig((draft) => { draft.clash.proxies_auto_delay_test_interval = Number(event.target.value) || 0 })} />
                   </Field>
+                  <Field label="测速 URL">
+                    <input value={config.clash.proxies_auto_delay_test_url} onChange={(event) => updateConfig((draft) => { draft.clash.proxies_auto_delay_test_url = event.target.value })} />
+                  </Field>
+                  <Field label="Provider 自动刷新">
+                    <select value={String(config.clash.providers_auto_refresh)} onChange={(event) => updateConfig((draft) => { draft.clash.providers_auto_refresh = event.target.value === 'true' })}>
+                      <option value="false">false</option>
+                      <option value="true">true</option>
+                    </select>
+                  </Field>
+                  <Field label="Provider 刷新间隔（分钟）">
+                    <input type="number" value={config.clash.providers_refresh_interval} onChange={(event) => updateConfig((draft) => { draft.clash.providers_refresh_interval = Number(event.target.value) || 0 })} />
+                  </Field>
                   <Field label="连接自动刷新">
                     <select value={String(config.clash.connections_auto_refresh)} onChange={(event) => updateConfig((draft) => { draft.clash.connections_auto_refresh = event.target.value === 'true' })}>
                       <option value="false">false</option>
@@ -1182,13 +1470,329 @@ function App() {
                     <input type="number" value={config.clash.connections_refresh_interval} onChange={(event) => updateConfig((draft) => { draft.clash.connections_refresh_interval = Number(event.target.value) || 0 })} />
                   </Field>
                 </div>
+                <div className="mt-4">
+                  <Field label="Mixin YAML">
+                    <textarea className="min-h-40 w-full bg-transparent font-mono text-xs outline-none" value={config.clash.mixin_content} onChange={(event) => updateConfig((draft) => { draft.clash.mixin_content = event.target.value })} />
+                  </Field>
+                </div>
+              </SectionCard>
+            </div>
+          ) : null}
+
+          {activeTab === 'routing' ? (
+            <div className="grid gap-5 xl:grid-cols-[0.9fr_1.1fr_1.2fr]">
+              <SectionCard
+                title="路由集"
+                action={
+                  <div className="flex gap-2">
+                    <ActionButton busy={busyAction === 'routing-init'} onClick={() => void handleInitializeBuiltinRouting(false)}>
+                      初始化
+                    </ActionButton>
+                    <ActionButton busy={false} onClick={addRoutingItem}>
+                      新增
+                    </ActionButton>
+                  </div>
+                }
+              >
+                <div className="grid gap-4">
+                  <Field label="全局 Domain Strategy">
+                    <select value={config.routing.domain_strategy} onChange={(event) => updateConfig((draft) => { draft.routing.domain_strategy = event.target.value })}>
+                      <option value="AsIs">AsIs</option>
+                      <option value="IPIfNonMatch">IPIfNonMatch</option>
+                      <option value="IPOnDemand">IPOnDemand</option>
+                    </select>
+                  </Field>
+                  <Field label="全局 sing-box Strategy">
+                    <select value={config.routing.domain_strategy_4_singbox} onChange={(event) => updateConfig((draft) => { draft.routing.domain_strategy_4_singbox = event.target.value })}>
+                      <option value="">default</option>
+                      <option value="prefer_ipv4">prefer_ipv4</option>
+                      <option value="prefer_ipv6">prefer_ipv6</option>
+                      <option value="ipv4_only">ipv4_only</option>
+                      <option value="ipv6_only">ipv6_only</option>
+                    </select>
+                  </Field>
+                  <Field label="模板 URL">
+                    <input value={routingTemplateUrlDraft} onChange={(event) => setRoutingTemplateUrlDraft(event.target.value)} />
+                  </Field>
+                  <div className="flex flex-wrap gap-2">
+                    <ActionButton busy={busyAction === 'routing-template-url'} onClick={() => void handleImportRoutingTemplateUrl()}>
+                      导入模板 URL
+                    </ActionButton>
+                    <ActionButton busy={busyAction === 'routing-init'} onClick={() => void handleInitializeBuiltinRouting(true)}>
+                      追加内置模板
+                    </ActionButton>
+                    <ActionButton busy={busyAction === 'routing-export'} onClick={() => void handleExportRoutingRules()}>
+                      导出规则
+                    </ActionButton>
+                  </div>
+                  <div className="space-y-3">
+                    {config.routing.items.map((item) => (
+                      <button
+                        key={item.id}
+                        className={`w-full rounded-2xl border px-4 py-3 text-left ${selectedRoutingId === item.id ? 'border-violet-400 bg-violet-500/10' : 'border-slate-800 bg-slate-950/70'}`}
+                        onClick={() => setSelectedRoutingId(item.id)}
+                      >
+                        <div className="flex items-center justify-between gap-3">
+                          <div>
+                            <p className="font-medium">{item.remarks || '未命名路由集'}</p>
+                            <p className="mt-1 text-xs text-slate-400">规则数：{item.rule_num} · {item.is_active ? '默认集' : '非默认'}</p>
+                          </div>
+                          <div className="flex gap-2">
+                            <button
+                              className="rounded-xl border border-slate-700 px-3 py-1 text-xs"
+                              onClick={(event) => {
+                                event.stopPropagation()
+                                void desktopApi.setDefaultRoutingItem(item.id).then(async (nextConfig) => {
+                                  setConfig(nextConfig)
+                                  setMessage('默认路由集已切换')
+                                  setPreview(await desktopApi.generatePreview())
+                                }).catch((error) => setMessage(String(error)))
+                              }}
+                            >
+                              设默认
+                            </button>
+                            <button
+                              className="rounded-xl border border-rose-800 px-3 py-1 text-xs text-rose-300"
+                              onClick={(event) => {
+                                event.stopPropagation()
+                                void desktopApi.removeRoutingItem(item.id).then((nextConfig) => {
+                                  setConfig(nextConfig)
+                                  setMessage('路由集已删除')
+                                }).catch((error) => setMessage(String(error)))
+                              }}
+                            >
+                              删除
+                            </button>
+                          </div>
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </SectionCard>
+
+              <SectionCard
+                title="规则列表"
+                action={
+                  <div className="flex gap-2">
+                    <ActionButton busy={false} onClick={addRoutingRule}>
+                      新增规则
+                    </ActionButton>
+                    <ActionButton
+                      busy={busyAction === 'routing-import'}
+                      onClick={() => {
+                        const raw = window.prompt('粘贴路由规则 JSON')
+                        if (!raw || !selectedRouting) {
+                          return
+                        }
+                        setBusyAction('routing-import')
+                        void desktopApi
+                          .importRoutingRules(selectedRouting.id, raw, false)
+                          .then(async (nextConfig) => {
+                            setConfig(nextConfig)
+                            setMessage('路由规则已导入')
+                            setPreview(await desktopApi.generatePreview())
+                          })
+                          .catch((error) => setMessage(String(error)))
+                          .finally(() => setBusyAction(null))
+                      }}
+                    >
+                      导入 JSON
+                    </ActionButton>
+                  </div>
+                }
+              >
+                {!selectedRouting ? <div className="text-sm text-slate-400">请先选择左侧路由集。</div> : null}
+                {selectedRouting ? (
+                  <div className="grid gap-4">
+                    <Field label="备注">
+                      <input value={selectedRouting.remarks} onChange={(event) => updateConfig((draft) => {
+                        const item = draft.routing.items.find((entry) => entry.id === selectedRouting.id)
+                        if (item) item.remarks = event.target.value
+                      })} />
+                    </Field>
+                    <Field label="自定义 ruleset 路径">
+                      <input value={selectedRouting.custom_ruleset_path_4_singbox ?? ''} onChange={(event) => updateConfig((draft) => {
+                        const item = draft.routing.items.find((entry) => entry.id === selectedRouting.id)
+                        if (item) item.custom_ruleset_path_4_singbox = event.target.value
+                      })} />
+                    </Field>
+                    <div className="space-y-2">
+                      {selectedRouting.rule_set.map((rule) => (
+                        <button
+                          key={rule.id}
+                          className={`w-full rounded-2xl border px-4 py-3 text-left ${selectedRoutingRuleId === rule.id ? 'border-violet-400 bg-violet-500/10' : 'border-slate-800 bg-slate-950/70'}`}
+                          onClick={() => setSelectedRoutingRuleId(rule.id)}
+                        >
+                          <p className="font-medium">{rule.remarks || '未命名规则'}</p>
+                          <p className="mt-1 text-xs text-slate-400">
+                            {rule.rule_type} · {rule.outbound_tag || 'proxy'} · {(rule.domain[0] || rule.ip[0] || rule.process[0] || rule.port || '-')}
+                          </p>
+                          <div className="mt-2 flex gap-2">
+                            <button
+                              className="rounded-xl border border-slate-700 px-3 py-1 text-xs"
+                              onClick={(event) => {
+                                event.stopPropagation()
+                                if (!selectedRouting) return
+                                void desktopApi.moveRoutingRule(selectedRouting.id, rule.id, 'up').then((nextConfig) => {
+                                  setConfig(nextConfig)
+                                }).catch((error) => setMessage(String(error)))
+                              }}
+                            >
+                              上移
+                            </button>
+                            <button
+                              className="rounded-xl border border-slate-700 px-3 py-1 text-xs"
+                              onClick={(event) => {
+                                event.stopPropagation()
+                                if (!selectedRouting) return
+                                void desktopApi.moveRoutingRule(selectedRouting.id, rule.id, 'down').then((nextConfig) => {
+                                  setConfig(nextConfig)
+                                }).catch((error) => setMessage(String(error)))
+                              }}
+                            >
+                              下移
+                            </button>
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+              </SectionCard>
+
+              <SectionCard title="规则详情">
+                {!selectedRoutingRule ? <div className="text-sm text-slate-400">请先选择一条规则。</div> : null}
+                {selectedRouting && selectedRoutingRule ? (
+                  <div className="grid gap-4 md:grid-cols-2">
+                    <Field label="备注">
+                      <input value={selectedRoutingRule.remarks ?? ''} onChange={(event) => updateConfig((draft) => {
+                        const rule = draft.routing.items.find((item) => item.id === selectedRouting.id)?.rule_set.find((entry) => entry.id === selectedRoutingRule.id)
+                        if (rule) rule.remarks = event.target.value
+                      })} />
+                    </Field>
+                    <Field label="启用">
+                      <select value={String(selectedRoutingRule.enabled)} onChange={(event) => updateConfig((draft) => {
+                        const rule = draft.routing.items.find((item) => item.id === selectedRouting.id)?.rule_set.find((entry) => entry.id === selectedRoutingRule.id)
+                        if (rule) rule.enabled = event.target.value === 'true'
+                      })}>
+                        <option value="true">true</option>
+                        <option value="false">false</option>
+                      </select>
+                    </Field>
+                    <Field label="RuleType">
+                      <select value={selectedRoutingRule.rule_type} onChange={(event) => updateConfig((draft) => {
+                        const rule = draft.routing.items.find((item) => item.id === selectedRouting.id)?.rule_set.find((entry) => entry.id === selectedRoutingRule.id)
+                        if (rule) rule.rule_type = event.target.value as RoutingRule['rule_type']
+                      })}>
+                        <option value="all">all</option>
+                        <option value="routing">routing</option>
+                        <option value="dns">dns</option>
+                      </select>
+                    </Field>
+                    <Field label="Outbound">
+                      <select value={selectedRoutingRule.outbound_tag ?? 'proxy'} onChange={(event) => updateConfig((draft) => {
+                        const rule = draft.routing.items.find((item) => item.id === selectedRouting.id)?.rule_set.find((entry) => entry.id === selectedRoutingRule.id)
+                        if (rule) rule.outbound_tag = event.target.value
+                      })}>
+                        <option value="proxy">proxy</option>
+                        <option value="direct">direct</option>
+                        <option value="block">block</option>
+                      </select>
+                    </Field>
+                    <Field label="Domain">
+                      <textarea className="min-h-24 w-full bg-transparent outline-none" value={selectedRoutingRule.domain.join('\n')} onChange={(event) => updateConfig((draft) => {
+                        const rule = draft.routing.items.find((item) => item.id === selectedRouting.id)?.rule_set.find((entry) => entry.id === selectedRoutingRule.id)
+                        if (rule) rule.domain = event.target.value.split('\n').map((item) => item.trim()).filter(Boolean)
+                      })} />
+                    </Field>
+                    <Field label="IP">
+                      <textarea className="min-h-24 w-full bg-transparent outline-none" value={selectedRoutingRule.ip.join('\n')} onChange={(event) => updateConfig((draft) => {
+                        const rule = draft.routing.items.find((item) => item.id === selectedRouting.id)?.rule_set.find((entry) => entry.id === selectedRoutingRule.id)
+                        if (rule) rule.ip = event.target.value.split('\n').map((item) => item.trim()).filter(Boolean)
+                      })} />
+                    </Field>
+                    <Field label="Process">
+                      <textarea className="min-h-24 w-full bg-transparent outline-none" value={selectedRoutingRule.process.join('\n')} onChange={(event) => updateConfig((draft) => {
+                        const rule = draft.routing.items.find((item) => item.id === selectedRouting.id)?.rule_set.find((entry) => entry.id === selectedRoutingRule.id)
+                        if (rule) rule.process = event.target.value.split('\n').map((item) => item.trim()).filter(Boolean)
+                      })} />
+                    </Field>
+                    <Field label="Protocol">
+                      <input value={selectedRoutingRule.protocol.join(',')} onChange={(event) => updateConfig((draft) => {
+                        const rule = draft.routing.items.find((item) => item.id === selectedRouting.id)?.rule_set.find((entry) => entry.id === selectedRoutingRule.id)
+                        if (rule) rule.protocol = event.target.value.split(',').map((item) => item.trim()).filter(Boolean)
+                      })} />
+                    </Field>
+                    <Field label="Port">
+                      <input value={selectedRoutingRule.port ?? ''} onChange={(event) => updateConfig((draft) => {
+                        const rule = draft.routing.items.find((item) => item.id === selectedRouting.id)?.rule_set.find((entry) => entry.id === selectedRoutingRule.id)
+                        if (rule) rule.port = event.target.value
+                      })} />
+                    </Field>
+                    <Field label="Network">
+                      <input value={selectedRoutingRule.network ?? ''} onChange={(event) => updateConfig((draft) => {
+                        const rule = draft.routing.items.find((item) => item.id === selectedRouting.id)?.rule_set.find((entry) => entry.id === selectedRoutingRule.id)
+                        if (rule) rule.network = event.target.value
+                      })} />
+                    </Field>
+                    <Field label="InboundTag">
+                      <input value={selectedRoutingRule.inbound_tag.join(',')} onChange={(event) => updateConfig((draft) => {
+                        const rule = draft.routing.items.find((item) => item.id === selectedRouting.id)?.rule_set.find((entry) => entry.id === selectedRoutingRule.id)
+                        if (rule) rule.inbound_tag = event.target.value.split(',').map((item) => item.trim()).filter(Boolean)
+                      })} />
+                    </Field>
+                  </div>
+                ) : null}
               </SectionCard>
             </div>
           ) : null}
 
           {activeTab === 'clash' ? (
             status.runtime.running && status.runtime.core_type === 'mihomo' ? (
-              <div className="grid gap-5 lg:grid-cols-[1fr_1fr]">
+              <div className="grid gap-5 xl:grid-cols-[0.85fr_1fr_1fr]">
+                <SectionCard
+                  title="配置与 Provider"
+                  action={
+                    <div className="flex gap-2">
+                      <ActionButton busy={busyAction === 'clash-rule-mode'} onClick={() => void handleUpdateClashRuleMode(config.clash.rule_mode)}>
+                        应用模式
+                      </ActionButton>
+                      <ActionButton busy={busyAction === 'clash-reload'} onClick={() => void handleReloadClashConfig()}>
+                        热重载
+                      </ActionButton>
+                    </div>
+                  }
+                >
+                  <div className="grid gap-4">
+                    <Field label="运行时 Rule Mode">
+                      <select value={config.clash.rule_mode} onChange={(event) => updateConfig((draft) => { draft.clash.rule_mode = event.target.value })}>
+                        <option value="rule">rule</option>
+                        <option value="global">global</option>
+                        <option value="direct">direct</option>
+                        <option value="unchanged">unchanged</option>
+                      </select>
+                    </Field>
+                    <div className="space-y-3">
+                      <p className="text-sm text-slate-400">Providers</p>
+                      {clashProxyProviders.length === 0 ? <div className="text-sm text-slate-500">暂无 provider 数据</div> : null}
+                      {clashProxyProviders.map((provider) => (
+                        <div key={provider.name} className="rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
+                          <p className="font-medium">{provider.name}</p>
+                          <p className="mt-1 text-xs text-slate-400">{provider.provider_type} · {provider.vehicle_type ?? 'unknown'}</p>
+                          <p className="mt-1 text-xs text-slate-400">节点数：{provider.proxies.length} · 更新时间：{provider.updated_at ?? '未知'}</p>
+                          <ActionButton
+                            className="mt-3"
+                            busy={busyAction === `clash-provider-${provider.name}`}
+                            onClick={() => void handleRefreshClashProvider(provider.name)}
+                          >
+                            刷新 Provider
+                          </ActionButton>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </SectionCard>
                 <SectionCard
                   title="代理组"
                   action={
@@ -1214,6 +1818,7 @@ function App() {
                             className="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm"
                             value={group.now ?? ''}
                             onChange={(event) => void handleClashProxySelect(group.name, event.target.value)}
+                            disabled={!['Selector', 'URLTest', 'Fallback', 'LoadBalance'].includes(group.proxy_type)}
                           >
                             {group.all.map((name) => (
                               <option key={name} value={name}>
@@ -1229,20 +1834,38 @@ function App() {
                 <SectionCard
                   title="连接"
                   action={
-                    <ActionButton busy={busyAction === 'clash-refresh'} onClick={() => void refreshClashState()}>
-                      刷新
-                    </ActionButton>
+                    <div className="flex gap-2">
+                      <ActionButton busy={busyAction === 'clash-refresh'} onClick={() => void refreshClashState()}>
+                        刷新
+                      </ActionButton>
+                      <ActionButton busy={busyAction === 'clash-close-all'} onClick={() => void handleCloseClashConnection('')}>
+                        关闭全部
+                      </ActionButton>
+                    </div>
                   }
                 >
                   <div className="space-y-3 text-sm text-slate-300">
-                    {clashConnections.length === 0 ? <div className="text-sm text-slate-400">暂无连接数据</div> : null}
-                    {clashConnections.map((connection) => (
+                    <Field label="连接过滤">
+                      <input value={clashConnectionFilter} onChange={(event) => setClashConnectionFilter(event.target.value)} />
+                    </Field>
+                    {filteredClashConnections.length === 0 ? <div className="text-sm text-slate-400">暂无连接数据</div> : null}
+                    {filteredClashConnections.map((connection) => (
                       <div key={connection.id} className="rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
                         <p className="font-mono text-xs text-slate-500">{connection.id}</p>
                         <p className="mt-2">{connection.host ?? connection.destination ?? '-'}</p>
                         <p className="mt-1 text-xs text-slate-400">
                           {connection.rule ?? '-'} · {connection.chains.join(' -> ') || '-'}
                         </p>
+                        <p className="mt-1 text-xs text-slate-500">
+                          ↑ {formatBytes(connection.upload)} / ↓ {formatBytes(connection.download)}
+                        </p>
+                        <ActionButton
+                          className="mt-3"
+                          busy={busyAction === `clash-close-${connection.id}`}
+                          onClick={() => void handleCloseClashConnection(connection.id)}
+                        >
+                          关闭连接
+                        </ActionButton>
                       </div>
                     ))}
                   </div>
@@ -1364,6 +1987,19 @@ function ActionButton({
       {busy ? '处理中...' : children}
     </button>
   )
+}
+
+function formatBytes(value?: number | null) {
+  if (!value) {
+    return '0 B'
+  }
+  if (value < 1024) {
+    return `${value} B`
+  }
+  if (value < 1024 * 1024) {
+    return `${(value / 1024).toFixed(1)} KB`
+  }
+  return `${(value / (1024 * 1024)).toFixed(1)} MB`
 }
 
 export default App

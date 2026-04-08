@@ -1,17 +1,22 @@
 use crate::models::{
     AppConfig, CoreType, DnsSettings, ExternalConfigFormat, MuxOverride, Profile,
-    ProfileConfigType, ProfileProtocol, ProxySettings, RoutingSettings, Subscription, TunSettings,
+    ProfileConfigType, ProfileProtocol, ProxySettings, RoutingItem, RoutingRule, RoutingRuleType,
+    RoutingSettings, RoutingTemplate, Subscription, TunSettings,
 };
 use anyhow::{anyhow, Context, Result};
 use base64::Engine;
 use regex::Regex;
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use url::Url;
+
+const BUILTIN_ROUTE_WHITE: &str = include_str!("../../../v2rayN/ServiceLib/Sample/custom_routing_white");
+const BUILTIN_ROUTE_BLACK: &str = include_str!("../../../v2rayN/ServiceLib/Sample/custom_routing_black");
+const BUILTIN_ROUTE_GLOBAL: &str = include_str!("../../../v2rayN/ServiceLib/Sample/custom_routing_global");
 
 #[derive(Debug, Clone)]
 pub struct ConfigArtifact {
@@ -63,6 +68,157 @@ pub fn ensure_profile(config: &AppConfig) -> Result<&Profile> {
         .iter()
         .find(|profile| &profile.id == selected)
         .context("未找到选中的节点")
+}
+
+pub fn ensure_routing_items(routing: &mut RoutingSettings) {
+    if routing.items.is_empty() {
+        routing.items = builtin_routing_items();
+    }
+    normalize_routing_items(routing);
+}
+
+pub fn builtin_routing_items() -> Vec<RoutingItem> {
+    [
+        ("V4-绕过大陆(Whitelist)", BUILTIN_ROUTE_WHITE),
+        ("V4-黑名单(Blacklist)", BUILTIN_ROUTE_BLACK),
+        ("V4-全局(Global)", BUILTIN_ROUTE_GLOBAL),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, (remarks, raw))| RoutingItem {
+        id: crate::models::new_id("routing"),
+        remarks: remarks.into(),
+        url: String::new(),
+        rule_set: parse_routing_rules_json(raw).unwrap_or_default(),
+        rule_num: parse_routing_rules_json(raw).map(|rules| rules.len()).unwrap_or(0),
+        enabled: true,
+        locked: false,
+        custom_icon: None,
+        custom_ruleset_path_4_singbox: None,
+        domain_strategy: None,
+        domain_strategy_4_singbox: None,
+        sort: index + 1,
+        is_active: index == 0,
+    })
+    .collect()
+}
+
+pub fn normalize_routing_items(routing: &mut RoutingSettings) {
+    if routing.domain_strategy.is_empty() {
+        routing.domain_strategy = "AsIs".into();
+    }
+
+    if routing.items.is_empty() {
+        return;
+    }
+
+    for (index, item) in routing.items.iter_mut().enumerate() {
+        if item.id.is_empty() {
+            item.id = crate::models::new_id("routing");
+        }
+        if item.sort == 0 {
+            item.sort = index + 1;
+        }
+        for rule in &mut item.rule_set {
+            if rule.id.is_empty() {
+                rule.id = crate::models::new_id("routing-rule");
+            }
+        }
+        item.rule_num = item.rule_set.len();
+    }
+
+    let active_id = routing
+        .items
+        .iter()
+        .find(|item| item.is_active)
+        .map(|item| item.id.clone())
+        .or_else(|| routing.routing_index_id.clone())
+        .or_else(|| routing.items.first().map(|item| item.id.clone()));
+
+    for item in &mut routing.items {
+        item.is_active = Some(&item.id) == active_id.as_ref();
+    }
+    routing.routing_index_id = active_id;
+    routing.items.sort_by_key(|item| item.sort);
+}
+
+pub fn parse_routing_rules_json(raw: &str) -> Result<Vec<RoutingRule>> {
+    let mut rules = serde_json::from_str::<Vec<RoutingRule>>(raw).context("路由规则 JSON 解析失败")?;
+    for rule in &mut rules {
+        if rule.id.is_empty() {
+            rule.id = crate::models::new_id("routing-rule");
+        }
+        if !rule.enabled {
+            continue;
+        }
+    }
+    Ok(rules)
+}
+
+pub fn export_routing_rules_json(rules: &[RoutingRule]) -> Result<String> {
+    serde_json::to_string_pretty(rules).context("导出路由规则 JSON 失败")
+}
+
+pub fn active_routing_item(routing: &RoutingSettings) -> Option<&RoutingItem> {
+    routing
+        .routing_index_id
+        .as_ref()
+        .and_then(|id| routing.items.iter().find(|item| &item.id == id))
+        .or_else(|| routing.items.iter().find(|item| item.is_active))
+        .or_else(|| routing.items.first())
+}
+
+pub fn set_active_routing_item(routing: &mut RoutingSettings, routing_id: &str) {
+    for item in &mut routing.items {
+        item.is_active = item.id == routing_id;
+    }
+    routing.routing_index_id = Some(routing_id.to_string());
+}
+
+pub fn routing_template_from_raw(raw: &str) -> Result<RoutingTemplate> {
+    serde_json::from_str::<RoutingTemplate>(raw).context("路由模板解析失败")
+}
+
+pub fn apply_routing_template(
+    routing: &mut RoutingSettings,
+    template: RoutingTemplate,
+    advanced_only: bool,
+) -> Result<usize> {
+    let prefix = template.version;
+    if !advanced_only && routing.items.iter().any(|item| item.remarks.starts_with(&prefix)) {
+        return Ok(0);
+    }
+
+    let mut max_sort = routing.items.iter().map(|item| item.sort).max().unwrap_or(0);
+    let mut imported = 0usize;
+    for (index, mut item) in template.routing_items.into_iter().enumerate() {
+        let rules = if !item.rule_set.is_empty() {
+            item.rule_set
+        } else {
+            Vec::new()
+        };
+        item.id = crate::models::new_id("routing");
+        item.remarks = format!("{prefix}-{}", item.remarks);
+        item.enabled = true;
+        item.is_active = !advanced_only && index == 0 && imported == 0;
+        item.sort = {
+            max_sort += 1;
+            max_sort
+        };
+        item.rule_set = rules
+            .into_iter()
+            .map(|mut rule| {
+                rule.id = crate::models::new_id("routing-rule");
+                rule
+            })
+            .collect();
+        item.rule_num = item.rule_set.len();
+        routing.items.push(item);
+        imported += 1;
+    }
+
+    normalize_routing_items(routing);
+    Ok(imported)
 }
 
 pub fn import_share_links(raw: &str, core_type: CoreType) -> Result<Vec<Profile>> {
@@ -601,16 +757,43 @@ fn patch_mihomo_config(raw: &str, config: &AppConfig) -> Result<String> {
     root.insert(serde_yaml::Value::from("mixed-port"), serde_yaml::Value::from(config.proxy.socks_port));
     root.insert(
         serde_yaml::Value::from("external-controller"),
-        serde_yaml::Value::from(format!(
-            "127.0.0.1:{}",
-            clash_external_controller_port(config)
+        serde_yaml::Value::from(format!("{}:{}", config.clash.bind_address, clash_external_controller_port(config))),
+    );
+    root.insert(serde_yaml::Value::from("allow-lan"), serde_yaml::Value::from(config.clash.allow_lan));
+    root.insert(serde_yaml::Value::from("bind-address"), serde_yaml::Value::from(config.clash.bind_address.clone()));
+    root.insert(serde_yaml::Value::from("ipv6"), serde_yaml::Value::from(config.clash.enable_ipv6));
+    root.insert(
+        serde_yaml::Value::from("mode"),
+        serde_yaml::Value::from(clash_mode(
+            if config.clash.rule_mode == "unchanged" {
+                &config.routing.mode
+            } else {
+                &config.clash.rule_mode
+            },
         )),
     );
-    root.insert(serde_yaml::Value::from("allow-lan"), serde_yaml::Value::from(false));
-    root.insert(serde_yaml::Value::from("ipv6"), serde_yaml::Value::from(config.clash.enable_ipv6));
-    root.insert(serde_yaml::Value::from("mode"), serde_yaml::Value::from(clash_mode(&config.routing.mode)));
     root.insert(serde_yaml::Value::from("log-level"), serde_yaml::Value::from("warning"));
-    root.remove(serde_yaml::Value::from("secret"));
+    if let Some(secret) = config.clash.secret.as_ref().filter(|value| !value.is_empty()) {
+        root.insert(serde_yaml::Value::from("secret"), serde_yaml::Value::from(secret.clone()));
+    }
+    if config.tun.enabled {
+        root.insert(
+            serde_yaml::Value::from("tun"),
+            serde_yaml::to_value(serde_json::json!({
+                "enable": true,
+                "stack": config.tun.stack,
+                "auto-route": config.tun.auto_route,
+                "auto-detect-interface": true,
+                "dns-hijack": ["any:53"],
+            }))
+            .context("生成 Clash TUN 片段失败")?,
+        );
+    }
+    if config.clash.enable_mixin_content && !config.clash.mixin_content.trim().is_empty() {
+        let mixin = serde_yaml::from_str::<serde_yaml::Value>(&config.clash.mixin_content)
+            .context("Clash mixin YAML 解析失败")?;
+        merge_yaml_mapping(root, mixin);
+    }
 
     serde_yaml::to_string(&yaml).context("生成 mihomo 运行配置失败")
 }
@@ -631,6 +814,72 @@ fn clash_mode(routing_mode: &str) -> &'static str {
     }
 }
 
+fn merge_yaml_mapping(root: &mut serde_yaml::Mapping, mixin: serde_yaml::Value) {
+    let Some(mixin_map) = mixin.as_mapping() else {
+        return;
+    };
+    for (key, value) in mixin_map {
+        if let Some(name) = key.as_str() {
+            if let Some(target_key) = name.strip_prefix("append-") {
+                merge_yaml_sequence(root, target_key, value.clone(), false);
+                continue;
+            }
+            if let Some(target_key) = name.strip_prefix("prepend-") {
+                merge_yaml_sequence(root, target_key, value.clone(), true);
+                continue;
+            }
+            if let Some(target_key) = name.strip_prefix("removed-") {
+                remove_yaml_sequence_items(root, target_key, value.clone());
+                continue;
+            }
+        }
+        root.insert(key.clone(), value.clone());
+    }
+}
+
+fn merge_yaml_sequence(
+    root: &mut serde_yaml::Mapping,
+    key: &str,
+    value: serde_yaml::Value,
+    prepend: bool,
+) {
+    let target_key = serde_yaml::Value::from(key);
+    let Some(source_items) = value.as_sequence().cloned() else {
+        root.insert(target_key, value);
+        return;
+    };
+    let target = root
+        .entry(target_key)
+        .or_insert_with(|| serde_yaml::Value::Sequence(vec![]));
+    let Some(items) = target.as_sequence_mut() else {
+        *target = serde_yaml::Value::Sequence(source_items);
+        return;
+    };
+    if prepend {
+        let mut merged = source_items;
+        merged.extend(items.clone());
+        *items = merged;
+    } else {
+        items.extend(source_items);
+    }
+}
+
+fn remove_yaml_sequence_items(root: &mut serde_yaml::Mapping, key: &str, value: serde_yaml::Value) {
+    let Some(remove_items) = value.as_sequence() else {
+        return;
+    };
+    let Some(existing) = root
+        .get_mut(serde_yaml::Value::from(key))
+        .and_then(serde_yaml::Value::as_sequence_mut)
+    else {
+        return;
+    };
+    existing.retain(|item| {
+        let current = serde_yaml::to_string(item).unwrap_or_default();
+        !remove_items.iter().any(|remove| current.starts_with(&serde_yaml::to_string(remove).unwrap_or_default()))
+    });
+}
+
 fn generate_sing_box_config(
     profile: &Profile,
     mux: &crate::models::MuxSettings,
@@ -640,6 +889,7 @@ fn generate_sing_box_config(
     routing: &RoutingSettings,
 ) -> Result<Value> {
     let outbound = build_singbox_outbound(profile, mux);
+    let (route_rules, route_rule_sets) = singbox_route_rules(tun, routing);
 
     let mut inbounds = vec![
         json!({
@@ -666,17 +916,20 @@ fn generate_sing_box_config(
     let mut route = json!({
         "auto_detect_interface": true,
         "final": singbox_final_outbound(routing),
-        "rules": singbox_route_rules(tun),
-        "default_domain_resolver": { "server": "bootstrap" }
+        "rules": route_rules,
+        "default_domain_resolver": {
+            "server": "bootstrap",
+            "strategy": active_singbox_domain_strategy(routing),
+        }
     });
-    route["rule_set"] = Value::Array(singbox_rule_set_entries(ALL_RULESET_TAGS));
+    route["rule_set"] = Value::Array(singbox_rule_set_entries(&route_rule_sets));
 
     Ok(json!({
         "log": {
             "level": "warn",
             "timestamp": true,
         },
-        "dns": singbox_dns_block(dns),
+        "dns": singbox_dns_block(dns, routing),
         "inbounds": inbounds,
         "outbounds": [
             outbound,
@@ -799,13 +1052,14 @@ fn generate_tun_helper_sing_box_config(
     proxy_relay_port: u16,
 ) -> Value {
     let interface_name = resolve_tun_interface_name(tun);
+    let static_rule_sets = vec!["geosite-cn".to_string(), "geoip-cn".to_string()];
 
     json!({
         "log": {
             "level": "warn",
             "timestamp": true
         },
-        "dns": singbox_dns_block(dns),
+        "dns": singbox_dns_block(dns, routing),
         "inbounds": [
             {
                 "type": "tun",
@@ -851,7 +1105,7 @@ fn generate_tun_helper_sing_box_config(
                 { "rule_set": ["geosite-cn"], "outbound": "direct" },
                 { "rule_set": ["geoip-cn"], "outbound": "direct" }
             ],
-            "rule_set": singbox_rule_set_entries(ALL_RULESET_TAGS)
+            "rule_set": singbox_rule_set_entries(&static_rule_sets)
         },
         "meta": {
             "selected_profile": profile.name,
@@ -885,7 +1139,7 @@ fn singbox_final_outbound(routing: &RoutingSettings) -> &'static str {
 
 const BOOTSTRAP_DNS_ADDRESS: &str = "223.5.5.5";
 
-fn singbox_dns_block(dns: &DnsSettings) -> Value {
+fn singbox_dns_block(dns: &DnsSettings, routing: &RoutingSettings) -> Value {
     let mut bootstrap = parse_dns_server_new_format(BOOTSTRAP_DNS_ADDRESS);
     bootstrap["tag"] = json!("bootstrap");
 
@@ -898,23 +1152,47 @@ fn singbox_dns_block(dns: &DnsSettings) -> Value {
     local["tag"] = json!("local");
     local["domain_resolver"] = json!("bootstrap");
 
+    let mut rules = vec![
+        json!({
+            "rule_set": ["geosite-google"],
+            "server": "remote",
+            "strategy": "prefer_ipv4"
+        }),
+        json!({
+            "rule_set": ["geosite-cn"],
+            "server": "local",
+            "strategy": "prefer_ipv4"
+        }),
+    ];
+
+    let mut collected_rule_sets = BTreeSet::from([
+        "geosite-google".to_string(),
+        "geosite-cn".to_string(),
+    ]);
+
+    if let Some(active) = active_routing_item(routing) {
+        for rule in &active.rule_set {
+            if !rule.enabled || matches!(rule.rule_type, RoutingRuleType::Routing) {
+                continue;
+            }
+            if let Some(dns_rule) = routing_rule_to_singbox_dns_rule(rule) {
+                if let Some(tags) = dns_rule.get("rule_set").and_then(Value::as_array) {
+                    for tag in tags.iter().filter_map(Value::as_str) {
+                        collected_rule_sets.insert(tag.to_string());
+                    }
+                }
+                rules.push(dns_rule);
+            }
+        }
+    }
+
     json!({
         "servers": [bootstrap, remote, local],
-        "rules": [
-            {
-                "rule_set": ["geosite-google"],
-                "server": "remote",
-                "strategy": "prefer_ipv4"
-            },
-            {
-                "rule_set": ["geosite-cn"],
-                "server": "local",
-                "strategy": "prefer_ipv4"
-            }
-        ],
+        "rules": rules,
         "final": "remote",
         "independent_cache": true,
-        "strategy": "prefer_ipv4"
+        "strategy": singbox_dns_strategy(routing),
+        "rule_set": singbox_rule_set_entries(&collected_rule_sets.into_iter().collect::<Vec<_>>())
     })
 }
 
@@ -938,12 +1216,271 @@ fn parse_dns_server_new_format(address: &str) -> Value {
     json!({ "type": "udp", "server": address })
 }
 
-const ALL_RULESET_TAGS: &[&str] = &["geosite-google", "geosite-cn", "geoip-cn"];
+fn singbox_dns_strategy(routing: &RoutingSettings) -> String {
+    let strategy = active_singbox_domain_strategy(routing);
+    if strategy.is_empty() {
+        "prefer_ipv4".into()
+    } else {
+        strategy
+    }
+}
+
+fn active_singbox_domain_strategy(routing: &RoutingSettings) -> String {
+    active_routing_item(routing)
+        .and_then(|item| item.domain_strategy_4_singbox.clone())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            (!routing.domain_strategy_4_singbox.is_empty())
+                .then(|| routing.domain_strategy_4_singbox.clone())
+        })
+        .unwrap_or_default()
+}
+
+fn active_xray_domain_strategy(routing: &RoutingSettings) -> String {
+    active_routing_item(routing)
+        .and_then(|item| item.domain_strategy.clone())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| routing.domain_strategy.clone())
+}
+
+fn normalize_outbound_tag(tag: Option<&str>) -> &'static str {
+    match tag.unwrap_or("proxy") {
+        "direct" => "direct",
+        "block" => "block",
+        _ => "proxy",
+    }
+}
+
+fn routing_rule_to_singbox_dns_rule(rule: &RoutingRule) -> Option<Value> {
+    let mut base = serde_json::Map::new();
+    let server = match normalize_outbound_tag(rule.outbound_tag.as_deref()) {
+        "direct" => "local",
+        "block" => "local",
+        _ => "remote",
+    };
+    base.insert("server".into(), json!(server));
+    if !apply_singbox_rule_matchers(rule, &mut base) {
+        return None;
+    }
+    Some(Value::Object(base))
+}
+
+fn routing_rule_to_singbox_route_rules(rule: &RoutingRule) -> (Vec<Value>, Vec<String>, bool) {
+    let mut rules = Vec::new();
+    let mut rule_sets = BTreeSet::new();
+    let outbound = normalize_outbound_tag(rule.outbound_tag.as_deref());
+    let contains_ip = rule.ip.iter().any(|value| !value.trim().is_empty());
+
+    let mut base = serde_json::Map::new();
+    if outbound == "block" {
+        base.insert("action".into(), json!("reject"));
+    } else {
+        base.insert("outbound".into(), json!(outbound));
+    }
+    apply_singbox_base_matchers(rule, &mut base);
+
+    let mut domain_rule = base.clone();
+    let mut has_domain_match = false;
+    for value in rule.domain.iter().filter(|value| !value.trim().is_empty()) {
+        if append_singbox_domain_matcher(value, &mut domain_rule, &mut rule_sets) {
+            has_domain_match = true;
+        }
+    }
+    if has_domain_match || has_non_domain_matcher(&domain_rule) {
+        rules.push(Value::Object(domain_rule));
+    }
+
+    let mut ip_rule = base.clone();
+    let mut has_ip_match = false;
+    for value in rule.ip.iter().filter(|value| !value.trim().is_empty()) {
+        if append_singbox_ip_matcher(value, &mut ip_rule, &mut rule_sets) {
+            has_ip_match = true;
+        }
+    }
+    if has_ip_match {
+        rules.push(Value::Object(ip_rule));
+    }
+
+    let mut process_rule = base.clone();
+    if !rule.process.is_empty() {
+        process_rule.insert("process_name".into(), json!(rule.process));
+        rules.push(Value::Object(process_rule));
+    }
+
+    if rules.is_empty() && has_non_domain_matcher(&base) {
+        rules.push(Value::Object(base));
+    }
+
+    (rules, rule_sets.into_iter().collect(), contains_ip)
+}
+
+fn apply_singbox_rule_matchers(rule: &RoutingRule, base: &mut serde_json::Map<String, Value>) -> bool {
+    apply_singbox_base_matchers(rule, base);
+    let mut matched = false;
+    let mut rule_sets = BTreeSet::new();
+    for value in rule.domain.iter().filter(|value| !value.trim().is_empty()) {
+        if append_singbox_domain_matcher(value, base, &mut rule_sets) {
+            matched = true;
+        }
+    }
+    for value in rule.ip.iter().filter(|value| !value.trim().is_empty()) {
+        if append_singbox_ip_matcher(value, base, &mut rule_sets) {
+            matched = true;
+        }
+    }
+    if !rule.process.is_empty() {
+        base.insert("process_name".into(), json!(rule.process));
+        matched = true;
+    }
+    matched
+}
+
+fn apply_singbox_base_matchers(rule: &RoutingRule, base: &mut serde_json::Map<String, Value>) {
+    if let Some(port) = rule.port.as_deref().filter(|value| !value.is_empty()) {
+        let (ports, ranges) = split_ports(port);
+        if !ports.is_empty() {
+            base.insert("port".into(), json!(ports));
+        }
+        if !ranges.is_empty() {
+            base.insert("port_range".into(), json!(ranges));
+        }
+    }
+    if let Some(network) = rule.network.as_deref().filter(|value| !value.is_empty()) {
+        let values = split_csv_text(network);
+        if !values.is_empty() {
+            base.insert("network".into(), json!(values));
+        }
+    }
+    if !rule.protocol.is_empty() {
+        base.insert("protocol".into(), json!(rule.protocol));
+    }
+    if !rule.inbound_tag.is_empty() {
+        base.insert("inbound".into(), json!(rule.inbound_tag));
+    }
+}
+
+fn has_non_domain_matcher(rule: &serde_json::Map<String, Value>) -> bool {
+    [
+        "port",
+        "port_range",
+        "network",
+        "protocol",
+        "inbound",
+        "process_name",
+    ]
+    .into_iter()
+    .any(|key| rule.contains_key(key))
+}
+
+fn append_singbox_domain_matcher(
+    raw: &str,
+    rule: &mut serde_json::Map<String, Value>,
+    rule_sets: &mut BTreeSet<String>,
+) -> bool {
+    if raw.starts_with('#') || raw.starts_with("ext:") || raw.starts_with("ext-domain:") {
+        return false;
+    }
+    if let Some(value) = raw.strip_prefix("geosite:") {
+        let tag = format!("geosite-{}", value);
+        push_json_array_string(rule, "rule_set", tag.clone());
+        rule_sets.insert(tag);
+        return true;
+    }
+    if let Some(value) = raw.strip_prefix("regexp:") {
+        push_json_array_string(rule, "domain_regex", value.replace("\\,", ","));
+        return true;
+    }
+    if let Some(value) = raw.strip_prefix("domain:") {
+        push_json_array_string(rule, "domain_suffix", value.to_string());
+        return true;
+    }
+    if let Some(value) = raw.strip_prefix("full:") {
+        push_json_array_string(rule, "domain", value.to_string());
+        return true;
+    }
+    if let Some(value) = raw.strip_prefix("keyword:") {
+        push_json_array_string(rule, "domain_keyword", value.to_string());
+        return true;
+    }
+    if let Some(value) = raw.strip_prefix("dotless:") {
+        push_json_array_string(rule, "domain_keyword", value.to_string());
+        return true;
+    }
+    push_json_array_string(rule, "domain", raw.replace("\\,", ","));
+    true
+}
+
+fn append_singbox_ip_matcher(
+    raw: &str,
+    rule: &mut serde_json::Map<String, Value>,
+    rule_sets: &mut BTreeSet<String>,
+) -> bool {
+    if raw.starts_with("ext:") || raw.starts_with("ext-ip:") {
+        return false;
+    }
+    if let Some(value) = raw.strip_prefix("geoip:") {
+        let tag = format!("geoip-{}", value);
+        push_json_array_string(rule, "rule_set", tag.clone());
+        rule_sets.insert(tag);
+        return true;
+    }
+    push_json_array_string(rule, "ip_cidr", raw.to_string());
+    true
+}
+
+fn collect_custom_ruleset_tags(path: &str) -> Vec<String> {
+    load_custom_singbox_rule_set(path)
+        .ok()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|item| item.get("tag").and_then(Value::as_str).map(ToString::to_string))
+        .collect()
+}
+
+fn load_custom_singbox_rule_set(path: &str) -> Result<Vec<Value>> {
+    let resolved = PathBuf::from(path);
+    if !resolved.exists() {
+        return Ok(vec![]);
+    }
+    let raw = fs::read_to_string(&resolved)
+        .with_context(|| format!("读取 sing-box 自定义 ruleset 失败: {}", resolved.display()))?;
+    serde_json::from_str::<Vec<Value>>(&raw).context("自定义 ruleset JSON 解析失败")
+}
+
+fn push_json_array_string(target: &mut serde_json::Map<String, Value>, key: &str, value: String) {
+    let entry = target
+        .entry(key.to_string())
+        .or_insert_with(|| Value::Array(vec![]));
+    if let Some(items) = entry.as_array_mut() {
+        items.push(json!(value));
+    }
+}
+
+fn split_ports(raw: &str) -> (Vec<u16>, Vec<String>) {
+    let mut ports = Vec::new();
+    let mut ranges = Vec::new();
+    for part in split_csv_text(raw) {
+        if part.contains('-') {
+            ranges.push(part.replace('-', ":"));
+        } else if let Ok(port) = part.parse::<u16>() {
+            ports.push(port);
+        }
+    }
+    (ports, ranges)
+}
+
+fn split_csv_text(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
 
 const SINGBOX_RULESET_URL: &str =
     "https://raw.githubusercontent.com/2dust/sing-box-rules/rule-set-{kind}/{tag}.srs";
 
-fn singbox_rule_set_entries(tags: &[&str]) -> Vec<Value> {
+fn singbox_rule_set_entries(tags: &[String]) -> Vec<Value> {
     tags.iter()
         .map(|tag| {
             let kind = if tag.starts_with("geoip") { "geoip" } else { "geosite" };
@@ -961,8 +1498,9 @@ fn singbox_rule_set_entries(tags: &[&str]) -> Vec<Value> {
         .collect()
 }
 
-fn singbox_route_rules(tun: &TunSettings) -> Value {
+fn singbox_route_rules(tun: &TunSettings, routing: &RoutingSettings) -> (Value, Vec<String>) {
     let mut rules: Vec<Value> = Vec::new();
+    let mut rule_sets = BTreeSet::new();
 
     if tun.enabled {
         rules.push(json!({ "network": "udp", "port": [135, 137, 138, 139, 5353], "action": "reject" }));
@@ -974,8 +1512,139 @@ fn singbox_route_rules(tun: &TunSettings) -> Value {
 
     rules.push(json!({ "rule_set": ["geosite-cn"], "outbound": "direct" }));
     rules.push(json!({ "rule_set": ["geoip-cn"], "outbound": "direct" }));
+    rule_sets.insert("geosite-cn".to_string());
+    rule_sets.insert("geoip-cn".to_string());
 
-    Value::Array(rules)
+    rules.push(json!({ "outbound": "direct", "clash_mode": "Direct" }));
+    rules.push(json!({ "outbound": "proxy", "clash_mode": "Global" }));
+
+    let resolve_strategy = active_singbox_domain_strategy(routing);
+    let mut ip_rules = Vec::new();
+    if routing.domain_strategy == "IPOnDemand" {
+        rules.push(json!({
+            "action": "resolve",
+            "strategy": resolve_strategy
+        }));
+    }
+
+    if let Some(active) = active_routing_item(routing) {
+        for user_rule in &active.rule_set {
+            if !user_rule.enabled || matches!(user_rule.rule_type, RoutingRuleType::Dns) {
+                continue;
+            }
+            let (route_rules, route_rule_sets, contains_ip) =
+                routing_rule_to_singbox_route_rules(user_rule);
+            for tag in route_rule_sets {
+                rule_sets.insert(tag);
+            }
+            if routing.domain_strategy == "IPIfNonMatch" && contains_ip {
+                ip_rules.extend(route_rules);
+            } else {
+                rules.extend(route_rules);
+            }
+        }
+        if let Some(custom_path) = active.custom_ruleset_path_4_singbox.as_deref() {
+            for tag in collect_custom_ruleset_tags(custom_path) {
+                rule_sets.insert(tag);
+            }
+        }
+    }
+
+    if routing.domain_strategy == "IPIfNonMatch" {
+        rules.push(json!({
+            "action": "resolve",
+            "strategy": resolve_strategy
+        }));
+        rules.extend(ip_rules);
+    }
+
+    (Value::Array(rules), rule_sets.into_iter().collect())
+}
+
+fn xray_routing_rules(routing: &RoutingSettings) -> Vec<Value> {
+    let mut rules = vec![json!({
+        "type": "field",
+        "port": "53",
+        "outboundTag": "direct"
+    })];
+
+    if let Some(active) = active_routing_item(routing) {
+        for rule in &active.rule_set {
+            if !rule.enabled || matches!(rule.rule_type, RoutingRuleType::Dns) {
+                continue;
+            }
+            rules.extend(routing_rule_to_xray_rules(rule));
+        }
+    }
+
+    let final_rule = if active_xray_domain_strategy(routing) == "IPIfNonMatch" {
+        json!({
+            "type": "field",
+            "ip": ["0.0.0.0/0", "::/0"],
+            "outboundTag": if routing.mode == "direct" { "direct" } else { "proxy" }
+        })
+    } else {
+        json!({
+            "type": "field",
+            "network": "tcp,udp",
+            "outboundTag": if routing.mode == "direct" { "direct" } else { "proxy" }
+        })
+    };
+    rules.push(final_rule);
+    rules
+}
+
+fn routing_rule_to_xray_rules(rule: &RoutingRule) -> Vec<Value> {
+    let outbound = normalize_outbound_tag(rule.outbound_tag.as_deref());
+    let base = json!({
+        "type": "field",
+        "outboundTag": outbound,
+        "port": rule.port.as_deref().filter(|value| !value.is_empty()),
+        "network": rule.network.as_deref().filter(|value| !value.is_empty()),
+        "protocol": (!rule.protocol.is_empty()).then_some(rule.protocol.clone()),
+        "inboundTag": (!rule.inbound_tag.is_empty()).then_some(rule.inbound_tag.clone()),
+    });
+
+    let mut rules = Vec::new();
+
+    if !rule.domain.is_empty() {
+        let mut item = base.clone();
+        item["domain"] = json!(rule
+            .domain
+            .iter()
+            .filter(|value| !value.starts_with('#') && !value.starts_with("ext:") && !value.starts_with("ext-domain:"))
+            .map(|value| value.replace("\\,", ","))
+            .collect::<Vec<_>>());
+        rules.push(item);
+    }
+
+    if !rule.ip.is_empty() {
+        let mut item = base.clone();
+        item["ip"] = json!(rule
+            .ip
+            .iter()
+            .filter(|value| !value.starts_with("ext:") && !value.starts_with("ext-ip:"))
+            .cloned()
+            .collect::<Vec<_>>());
+        rules.push(item);
+    }
+
+    if !rule.process.is_empty() {
+        let mut item = base.clone();
+        item["process"] = json!(rule.process);
+        rules.push(item);
+    }
+
+    if rules.is_empty()
+        && (rule.port.as_deref().is_some_and(|value| !value.is_empty())
+            || rule.network.as_deref().is_some_and(|value| !value.is_empty())
+            || !rule.protocol.is_empty()
+            || !rule.inbound_tag.is_empty())
+    {
+        rules.push(base);
+    }
+
+    rules
 }
 
 fn generate_xray_config(
@@ -1092,18 +1761,7 @@ fn generate_xray_config(
         json!({ "tag": "block", "protocol": "blackhole", "settings": {} }),
     ];
 
-    let mut rules = vec![
-        json!({
-            "type": "field",
-            "port": "53",
-            "outboundTag": "direct"
-        }),
-        json!({
-            "type": "field",
-            "network": "tcp,udp",
-            "outboundTag": if routing.mode == "direct" { "direct" } else { "proxy" }
-        }),
-    ];
+    let mut rules = xray_routing_rules(routing);
 
     if let Some((tun_protect_port, proxy_relay_port)) = tun_ports {
         inbounds.push(json!({
@@ -1149,7 +1807,7 @@ fn generate_xray_config(
         "inbounds": inbounds,
         "outbounds": outbounds,
         "routing": {
-            "domainStrategy": "IPIfNonMatch",
+            "domainStrategy": active_xray_domain_strategy(routing),
             "rules": rules
         }
     }))

@@ -239,14 +239,76 @@ impl Default for DnsSettings {
 #[serde(default)]
 pub struct RoutingSettings {
     pub mode: String,
+    pub domain_strategy: String,
+    pub domain_strategy_4_singbox: String,
+    pub routing_index_id: Option<String>,
+    pub template_source_url: Option<String>,
+    pub items: Vec<RoutingItem>,
 }
 
 impl Default for RoutingSettings {
     fn default() -> Self {
         Self {
             mode: "rule".into(),
+            domain_strategy: "AsIs".into(),
+            domain_strategy_4_singbox: String::new(),
+            routing_index_id: None,
+            template_source_url: None,
+            items: vec![],
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutingRuleType {
+    #[default]
+    All,
+    Routing,
+    Dns,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct RoutingRule {
+    pub id: String,
+    pub rule_type: RoutingRuleType,
+    pub enabled: bool,
+    pub remarks: Option<String>,
+    pub type_name: Option<String>,
+    pub port: Option<String>,
+    pub network: Option<String>,
+    pub inbound_tag: Vec<String>,
+    pub outbound_tag: Option<String>,
+    pub ip: Vec<String>,
+    pub domain: Vec<String>,
+    pub protocol: Vec<String>,
+    pub process: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct RoutingItem {
+    pub id: String,
+    pub remarks: String,
+    pub url: String,
+    pub rule_set: Vec<RoutingRule>,
+    pub rule_num: usize,
+    pub enabled: bool,
+    pub locked: bool,
+    pub custom_icon: Option<String>,
+    pub custom_ruleset_path_4_singbox: Option<String>,
+    pub domain_strategy: Option<String>,
+    pub domain_strategy_4_singbox: Option<String>,
+    pub sort: usize,
+    pub is_active: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct RoutingTemplate {
+    pub version: String,
+    pub routing_items: Vec<RoutingItem>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -280,9 +342,18 @@ impl Default for MuxSettings {
 pub struct ClashSettings {
     pub external_controller_port: u16,
     pub enable_ipv6: bool,
+    pub allow_lan: bool,
+    pub bind_address: String,
+    pub rule_mode: String,
+    pub secret: Option<String>,
+    pub enable_mixin_content: bool,
+    pub mixin_content: String,
     pub proxies_sorting: u8,
     pub proxies_auto_refresh: bool,
     pub proxies_auto_delay_test_interval: u16,
+    pub proxies_auto_delay_test_url: String,
+    pub providers_auto_refresh: bool,
+    pub providers_refresh_interval: u16,
     pub connections_auto_refresh: bool,
     pub connections_refresh_interval: u16,
 }
@@ -292,9 +363,18 @@ impl Default for ClashSettings {
         Self {
             external_controller_port: 10813,
             enable_ipv6: false,
+            allow_lan: false,
+            bind_address: "127.0.0.1".into(),
+            rule_mode: "rule".into(),
+            secret: None,
+            enable_mixin_content: false,
+            mixin_content: String::new(),
             proxies_sorting: 0,
             proxies_auto_refresh: false,
             proxies_auto_delay_test_interval: 10,
+            proxies_auto_delay_test_url: "https://www.gstatic.com/generate_204".into(),
+            providers_auto_refresh: false,
+            providers_refresh_interval: 10,
             connections_auto_refresh: false,
             connections_refresh_interval: 2,
         }
@@ -409,6 +489,15 @@ pub struct ClashConnection {
     pub host: Option<String>,
     pub destination: Option<String>,
     pub start: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClashProxyProvider {
+    pub name: String,
+    pub provider_type: String,
+    pub vehicle_type: Option<String>,
+    pub updated_at: Option<String>,
+    pub proxies: Vec<String>,
 }
 
 pub fn new_id(prefix: &str) -> String {
