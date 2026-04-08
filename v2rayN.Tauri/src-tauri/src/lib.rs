@@ -13,7 +13,8 @@ use app_state::SharedState;
 use config_store::ConfigStore;
 use core_runtime::RuntimeManager;
 use core_update::CorePaths;
-use tauri::Manager;
+use std::{sync::Mutex, thread, time::Duration};
+use tauri::{Emitter, Manager};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -33,7 +34,10 @@ pub fn run() {
                 store,
                 core_paths,
                 runtime: RuntimeManager::new(),
+                subscription_refresh_lock: Mutex::new(()),
             });
+
+            start_subscription_scheduler(app.handle().clone());
 
             Ok(())
         })
@@ -61,6 +65,7 @@ pub fn run() {
             commands::get_clash_proxy_groups,
             commands::select_clash_proxy,
             commands::get_clash_connections,
+            commands::test_clash_proxy_delay,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
@@ -84,4 +89,20 @@ fn cleanup_runtime(app: &tauri::AppHandle) {
             }
         }
     }
+}
+
+fn start_subscription_scheduler(app: tauri::AppHandle) {
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_secs(60));
+        let state = app.state::<SharedState>();
+        match commands::auto_refresh_due_subscriptions(&state) {
+            Ok(true) => {
+                let _ = app.emit("app-state-changed", "subscription_auto_refresh");
+            }
+            Ok(false) => {}
+            Err(error) => {
+                log::warn!("自动刷新订阅失败: {error}");
+            }
+        }
+    });
 }

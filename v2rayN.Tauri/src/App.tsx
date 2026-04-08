@@ -46,9 +46,13 @@ function App() {
     const unlistenPromise = desktopApi.onCoreLog((event) => {
       setLogs((current) => [...current.slice(-499), event])
     })
+    const stateChangedPromise = desktopApi.onAppStateChanged(() => {
+      void loadStatus()
+    })
 
     return () => {
       void unlistenPromise.then((unlisten) => unlisten())
+      void stateChangedPromise.then((unlisten) => unlisten())
     }
   }, [])
 
@@ -56,11 +60,71 @@ function App() {
     return config?.profiles.find((profile) => profile.id === selectedProfileId) ?? null
   }, [config, selectedProfileId])
 
+  const sortedClashProxyGroups = useMemo(() => {
+    const groups = [...clashProxyGroups]
+    switch (config?.clash.proxies_sorting) {
+      case 0:
+        return groups.sort((a, b) => (a.last_delay_ms ?? Number.MAX_SAFE_INTEGER) - (b.last_delay_ms ?? Number.MAX_SAFE_INTEGER))
+      case 1:
+        return groups.sort((a, b) => a.name.localeCompare(b.name))
+      default:
+        return groups
+    }
+  }, [clashProxyGroups, config?.clash.proxies_sorting])
+
   useEffect(() => {
     if (activeTab === 'clash' && status?.runtime.running && status.runtime.core_type === 'mihomo') {
       void refreshClashState()
     }
   }, [activeTab, status?.runtime.running, status?.runtime.core_type])
+
+  useEffect(() => {
+    if (
+      activeTab !== 'clash' ||
+      status?.runtime.core_type !== 'mihomo' ||
+      !status?.runtime.running ||
+      !config?.clash.proxies_auto_refresh
+    ) {
+      return
+    }
+
+    const intervalMinutes = Math.max(1, config.clash.proxies_auto_delay_test_interval)
+    const timer = window.setInterval(() => {
+      void refreshClashState(true)
+    }, intervalMinutes * 60_000)
+
+    return () => window.clearInterval(timer)
+  }, [
+    activeTab,
+    status?.runtime.core_type,
+    status?.runtime.running,
+    config?.clash.proxies_auto_refresh,
+    config?.clash.proxies_auto_delay_test_interval,
+  ])
+
+  useEffect(() => {
+    if (
+      activeTab !== 'clash' ||
+      status?.runtime.core_type !== 'mihomo' ||
+      !status?.runtime.running ||
+      !config?.clash.connections_auto_refresh
+    ) {
+      return
+    }
+
+    const intervalSteps = Math.max(1, config.clash.connections_refresh_interval)
+    const timer = window.setInterval(() => {
+      void refreshClashConnectionsOnly()
+    }, intervalSteps * 5_000)
+
+    return () => window.clearInterval(timer)
+  }, [
+    activeTab,
+    status?.runtime.core_type,
+    status?.runtime.running,
+    config?.clash.connections_auto_refresh,
+    config?.clash.connections_refresh_interval,
+  ])
 
   async function loadStatus() {
     try {
@@ -96,13 +160,37 @@ function App() {
     }
   }
 
-  async function refreshClashState() {
+  async function refreshClashState(runDelayTest = false) {
+    setBusyAction('clash-refresh')
     try {
       const [groups, connections] = await Promise.all([
         desktopApi.getClashProxyGroups(),
         desktopApi.getClashConnections(),
       ])
-      setClashProxyGroups(groups)
+      const enrichedGroups = runDelayTest
+        ? await Promise.all(
+            groups.map(async (group) => {
+              try {
+                const delay = await desktopApi.testClashProxyDelay(group.name)
+                return { ...group, last_delay_ms: delay }
+              } catch {
+                return group
+              }
+            }),
+          )
+        : groups
+      setClashProxyGroups(enrichedGroups)
+      setClashConnections(connections)
+    } catch (error) {
+      setMessage(String(error))
+    } finally {
+      setBusyAction((current) => (current === 'clash-refresh' ? null : current))
+    }
+  }
+
+  async function refreshClashConnectionsOnly() {
+    try {
+      const connections = await desktopApi.getClashConnections()
       setClashConnections(connections)
     } catch (error) {
       setMessage(String(error))
@@ -416,6 +504,7 @@ function App() {
       auto_update_interval_secs: null,
       convert_core_target: null,
       use_proxy_on_refresh: true,
+      last_checked_at: null,
       last_synced_at: null,
       last_error: null,
     }
@@ -866,7 +955,7 @@ function App() {
                           }}
                         />
                       </Field>
-                      <Field label="自动更新间隔（秒）">
+                      <Field label="自动更新间隔（分钟）">
                         <input
                           type="number"
                           value={subscription.auto_update_interval_secs ?? ''}
@@ -944,7 +1033,8 @@ function App() {
                         </button>
                       </div>
                     </div>
-                    <p className="mt-3 text-xs text-slate-400">最近同步：{subscription.last_synced_at ?? '未同步'}</p>
+                    <p className="mt-3 text-xs text-slate-400">最近检查：{subscription.last_checked_at ?? '未检查'}</p>
+                    <p className="mt-1 text-xs text-slate-400">最近同步：{subscription.last_synced_at ?? '未同步'}</p>
                     {subscription.last_error ? (
                       <p className="mt-1 text-xs text-rose-300">最近错误：{subscription.last_error}</p>
                     ) : null}
@@ -1072,7 +1162,14 @@ function App() {
                       <option value="true">true</option>
                     </select>
                   </Field>
-                  <Field label="代理组测速间隔（秒）">
+                  <Field label="代理组排序">
+                    <select value={String(config.clash.proxies_sorting)} onChange={(event) => updateConfig((draft) => { draft.clash.proxies_sorting = Number(event.target.value) || 0 })}>
+                      <option value="0">按延迟</option>
+                      <option value="1">按名称</option>
+                      <option value="2">保持原序</option>
+                    </select>
+                  </Field>
+                  <Field label="代理组测速间隔（分钟）">
                     <input type="number" value={config.clash.proxies_auto_delay_test_interval} onChange={(event) => updateConfig((draft) => { draft.clash.proxies_auto_delay_test_interval = Number(event.target.value) || 0 })} />
                   </Field>
                   <Field label="连接自动刷新">
@@ -1081,7 +1178,7 @@ function App() {
                       <option value="true">true</option>
                     </select>
                   </Field>
-                  <Field label="连接刷新间隔（秒）">
+                  <Field label="连接刷新间隔（5秒步长）">
                     <input type="number" value={config.clash.connections_refresh_interval} onChange={(event) => updateConfig((draft) => { draft.clash.connections_refresh_interval = Number(event.target.value) || 0 })} />
                   </Field>
                 </div>
@@ -1095,17 +1192,23 @@ function App() {
                 <SectionCard
                   title="代理组"
                   action={
-                    <ActionButton busy={busyAction === 'clash-refresh'} onClick={() => void refreshClashState()}>
-                      刷新
-                    </ActionButton>
+                    <div className="flex gap-2">
+                      <ActionButton busy={busyAction === 'clash-refresh'} onClick={() => void refreshClashState()}>
+                        刷新
+                      </ActionButton>
+                      <ActionButton busy={busyAction === 'clash-refresh'} onClick={() => void refreshClashState(true)}>
+                        测速
+                      </ActionButton>
+                    </div>
                   }
                 >
                   <div className="space-y-4">
-                    {clashProxyGroups.length === 0 ? <div className="text-sm text-slate-400">暂无代理组数据</div> : null}
-                    {clashProxyGroups.map((group) => (
+                    {sortedClashProxyGroups.length === 0 ? <div className="text-sm text-slate-400">暂无代理组数据</div> : null}
+                    {sortedClashProxyGroups.map((group) => (
                       <div key={group.name} className="rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
                         <p className="font-medium">{group.name}</p>
                         <p className="mt-1 text-xs text-slate-400">{group.proxy_type}</p>
+                        <p className="mt-1 text-xs text-slate-400">最近延迟：{group.last_delay_ms ? `${group.last_delay_ms} ms` : '未知'}</p>
                         <div className="mt-3 flex gap-3">
                           <select
                             className="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm"

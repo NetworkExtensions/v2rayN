@@ -55,6 +55,7 @@ export interface Subscription {
   auto_update_interval_secs?: number | null
   convert_core_target?: CoreType | null
   use_proxy_on_refresh: boolean
+  last_checked_at?: string | null
   last_synced_at?: string | null
   last_error?: string | null
 }
@@ -98,6 +99,7 @@ export interface MuxSettings {
 export interface ClashSettings {
   external_controller_port: number
   enable_ipv6: boolean
+  proxies_sorting: number
   proxies_auto_refresh: boolean
   proxies_auto_delay_test_interval: number
   connections_auto_refresh: boolean
@@ -182,6 +184,7 @@ export interface ClashProxyGroup {
   proxy_type: string
   now?: string | null
   all: string[]
+  last_delay_ms?: number | null
 }
 
 export interface ClashConnection {

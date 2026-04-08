@@ -13,6 +13,8 @@ use reqwest::blocking::Client;
 use reqwest::Proxy;
 use serde_json::{json, Value};
 use std::path::PathBuf;
+use std::thread;
+use std::time::Duration;
 use tauri::{AppHandle, State};
 
 fn load_status(app: &AppHandle, state: &SharedState) -> Result<AppStatus> {
@@ -110,6 +112,60 @@ fn download_subscription_with_fallback(
     download_text(url, user_agent, None)
 }
 
+pub fn auto_refresh_due_subscriptions(state: &SharedState) -> Result<bool> {
+    let _guard = state
+        .subscription_refresh_lock
+        .lock()
+        .map_err(|_| anyhow::anyhow!("订阅刷新锁不可用"))?;
+
+    let mut config = state.store.load()?;
+    let import_dir = PathBuf::from(state.store.paths().bin_configs).join("imported");
+    let socks_port = config.proxy.socks_port;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    let mut changed = false;
+
+    for index in 0..config.subscriptions.len() {
+        let Some(interval_secs) = config.subscriptions[index].auto_update_interval_secs else {
+            continue;
+        };
+        if interval_secs == 0 {
+            continue;
+        }
+        let interval_window = interval_secs.saturating_mul(60);
+
+        let last_checked = config.subscriptions[index]
+            .last_checked_at
+            .as_deref()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        if now.saturating_sub(last_checked) < interval_window {
+            continue;
+        }
+
+        if config.subscriptions[index].enabled && !config.subscriptions[index].url.trim().is_empty() {
+            if let Err(error) =
+                refresh_subscription_impl(&mut config, index, CoreType::SingBox, socks_port, &import_dir)
+            {
+                domain::apply_subscription_error(&mut config.subscriptions[index], error.to_string());
+            }
+        } else {
+            domain::apply_subscription_checked(&mut config.subscriptions[index]);
+        }
+
+        changed = true;
+        thread::sleep(Duration::from_secs(1));
+    }
+
+    if changed {
+        state.store.save(&config)?;
+    }
+
+    Ok(changed)
+}
+
 #[tauri::command]
 pub fn get_app_status(app: AppHandle, state: State<'_, SharedState>) -> Result<AppStatus, String> {
     load_status(&app, &state).map_err(error_to_string)
@@ -193,6 +249,10 @@ pub fn refresh_subscription(
     core_type: CoreType,
     state: State<'_, SharedState>,
 ) -> Result<AppConfig, String> {
+    let _guard = state
+        .subscription_refresh_lock
+        .lock()
+        .map_err(|_| "订阅刷新锁不可用".to_string())?;
     let mut config = state.store.load().map_err(error_to_string)?;
     let subscription_index = config
         .subscriptions
@@ -211,6 +271,7 @@ pub fn refresh_subscription(
         &import_dir,
     ) {
         domain::apply_subscription_error(&mut config.subscriptions[subscription_index], error.to_string());
+        state.store.save(&config).map_err(error_to_string)?;
         return Err(error_to_string(error));
     }
     state.store.save(&config).map_err(error_to_string)?;
@@ -219,6 +280,10 @@ pub fn refresh_subscription(
 
 #[tauri::command]
 pub fn refresh_all_subscriptions(core_type: CoreType, state: State<'_, SharedState>) -> Result<AppConfig, String> {
+    let _guard = state
+        .subscription_refresh_lock
+        .lock()
+        .map_err(|_| "订阅刷新锁不可用".to_string())?;
     let mut config = state.store.load().map_err(error_to_string)?;
     let import_dir = PathBuf::from(state.store.paths().bin_configs).join("imported");
     let socks_port = config.proxy.socks_port;
@@ -408,6 +473,7 @@ pub fn get_clash_proxy_groups(state: State<'_, SharedState>) -> Result<Vec<Clash
                     .to_string(),
                 now: proxy.get("now").and_then(Value::as_str).map(str::to_string),
                 all,
+                last_delay_ms: latest_delay_ms(proxy.as_object()),
             });
         }
     }
@@ -468,6 +534,12 @@ pub fn get_clash_connections(state: State<'_, SharedState>) -> Result<Vec<ClashC
     Ok(connections)
 }
 
+#[tauri::command]
+pub fn test_clash_proxy_delay(group_name: String, state: State<'_, SharedState>) -> Result<u64, String> {
+    let config = state.store.load().map_err(error_to_string)?;
+    clash_api_delay_test(&config, &group_name).map_err(error_to_string)
+}
+
 fn clash_api_get(config: &AppConfig, path: &str) -> Result<Value> {
     let client = build_client("v2rayN-tauri", None)?;
     let url = format!("http://127.0.0.1:{}{}", config.clash.external_controller_port, path);
@@ -480,6 +552,28 @@ fn clash_api_put(config: &AppConfig, path: &str, body: Value) -> Result<()> {
     let url = format!("http://127.0.0.1:{}{}", config.clash.external_controller_port, path);
     client.put(url).json(&body).send()?.error_for_status()?;
     Ok(())
+}
+
+fn clash_api_delay_test(config: &AppConfig, group_name: &str) -> Result<u64> {
+    let client = build_client("v2rayN-tauri", None)?;
+    let url = format!(
+        "http://127.0.0.1:{}/proxies/{}/delay?timeout=10000&url=https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204",
+        config.clash.external_controller_port,
+        urlencoding::encode(group_name)
+    );
+    let response = client.get(url).send()?.error_for_status()?;
+    let payload: Value = response.json()?;
+    payload
+        .get("delay")
+        .and_then(Value::as_u64)
+        .context("测速结果缺少 delay 字段")
+}
+
+fn latest_delay_ms(proxy: Option<&serde_json::Map<String, Value>>) -> Option<u64> {
+    proxy
+        .and_then(|proxy| proxy.get("history"))
+        .and_then(Value::as_array)
+        .and_then(|history| history.iter().rev().find_map(|entry| entry.get("delay").and_then(Value::as_u64)))
 }
 
 fn error_to_string(error: impl std::fmt::Display) -> String {

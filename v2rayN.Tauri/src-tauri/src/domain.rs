@@ -147,6 +147,7 @@ pub fn merge_profiles(
 }
 
 pub fn apply_subscription_result(subscription: &mut Subscription) {
+    apply_subscription_checked(subscription);
     subscription.last_synced_at = Some(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -157,7 +158,17 @@ pub fn apply_subscription_result(subscription: &mut Subscription) {
 }
 
 pub fn apply_subscription_error(subscription: &mut Subscription, message: impl Into<String>) {
+    apply_subscription_checked(subscription);
     subscription.last_error = Some(message.into());
+}
+
+pub fn apply_subscription_checked(subscription: &mut Subscription) {
+    subscription.last_checked_at = Some(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs().to_string())
+            .unwrap_or_else(|_| "0".into()),
+    );
 }
 
 pub fn filter_profiles(imported: Vec<Profile>, filter: Option<&str>) -> Result<Vec<Profile>> {
@@ -179,22 +190,17 @@ pub fn detect_import_format(raw: &str) -> ImportFormat {
     }
 
     if let Ok(value) = serde_json::from_str::<Value>(raw) {
-        if value.get("inbounds").is_some() && value.get("outbounds").is_some() && value.get("route").is_some() {
+        if json_contains_singbox_config(&value) {
             return ImportFormat::SingBoxJson;
         }
-        if value.get("inbounds").is_some() && value.get("outbounds").is_some() && value.get("routing").is_some() {
+        if json_contains_xray_config(&value) {
             return ImportFormat::XrayJson;
         }
     }
 
     if let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(raw) {
-        if let Some(mapping) = value.as_mapping() {
-            if mapping.contains_key(serde_yaml::Value::from("proxies"))
-                || mapping.contains_key(serde_yaml::Value::from("proxy-groups"))
-                || mapping.contains_key(serde_yaml::Value::from("proxy-providers"))
-            {
-                return ImportFormat::ClashYaml;
-            }
+        if yaml_is_clash_config(&value) {
+            return ImportFormat::ClashYaml;
         }
     }
 
@@ -216,10 +222,11 @@ pub fn preview_import(raw: &str, core_type: CoreType) -> Result<ImportPreview> {
         }
         ImportFormat::SingBoxJson => {
             let names = extract_json_outbound_names(raw, "tag")?;
+            let profile_count = names.len().max(1);
             Ok(ImportPreview {
                 format: ImportFormat::SingBoxJson,
                 profile_names: names,
-                profile_count: 1,
+                profile_count,
                 stores_as_external: true,
                 external_format: Some(ExternalConfigFormat::SingBox),
                 message: Some("将作为外部 sing-box 配置导入".into()),
@@ -227,10 +234,11 @@ pub fn preview_import(raw: &str, core_type: CoreType) -> Result<ImportPreview> {
         }
         ImportFormat::XrayJson => {
             let names = extract_json_outbound_names(raw, "tag")?;
+            let profile_count = names.len().max(1);
             Ok(ImportPreview {
                 format: ImportFormat::XrayJson,
                 profile_names: names,
-                profile_count: 1,
+                profile_count,
                 stores_as_external: true,
                 external_format: Some(ExternalConfigFormat::Xray),
                 message: Some("将作为外部 Xray 配置导入".into()),
@@ -263,28 +271,28 @@ pub fn import_full_config(raw: &str, storage_dir: &Path) -> Result<Vec<Profile>>
         .with_context(|| format!("创建导入配置目录失败: {}", storage_dir.display()))?;
 
     match detect_import_format(raw) {
-        ImportFormat::SingBoxJson => {
-            let path = persist_external_config(raw, storage_dir, "singbox", "json")?;
-            Ok(vec![build_external_profile(
-                "sing-box 外部配置",
-                CoreType::SingBox,
-                ExternalConfigFormat::SingBox,
-                &path,
-            )])
-        }
-        ImportFormat::XrayJson => {
-            let path = persist_external_config(raw, storage_dir, "xray", "json")?;
-            Ok(vec![build_external_profile(
-                "Xray 外部配置",
-                CoreType::Xray,
-                ExternalConfigFormat::Xray,
-                &path,
-            )])
-        }
+        ImportFormat::SingBoxJson => import_json_external_configs(
+            raw,
+            storage_dir,
+            "singbox",
+            CoreType::SingBox,
+            ExternalConfigFormat::SingBox,
+            "singbox_custom",
+            extract_json_profile_name,
+        ),
+        ImportFormat::XrayJson => import_json_external_configs(
+            raw,
+            storage_dir,
+            "xray",
+            CoreType::Xray,
+            ExternalConfigFormat::Xray,
+            "v2ray_custom",
+            extract_xray_profile_name,
+        ),
         ImportFormat::ClashYaml => {
             let path = persist_external_config(raw, storage_dir, "clash", "yaml")?;
             Ok(vec![build_external_profile(
-                "Clash 外部配置",
+                "clash_custom",
                 CoreType::Mihomo,
                 ExternalConfigFormat::Clash,
                 &path,
@@ -309,7 +317,7 @@ fn build_external_profile(
     path: &str,
 ) -> Profile {
     Profile {
-        name: format!("{name} {}", new_timestamp_suffix()),
+        name: name.into(),
         core_type,
         config_type: ProfileConfigType::External,
         external_config_format: Some(external_format),
@@ -321,14 +329,53 @@ fn build_external_profile(
     }
 }
 
+fn import_json_external_configs(
+    raw: &str,
+    storage_dir: &Path,
+    prefix: &str,
+    core_type: CoreType,
+    external_format: ExternalConfigFormat,
+    fallback_name: &str,
+    name_fn: fn(&Value, usize) -> String,
+) -> Result<Vec<Profile>> {
+    let value = serde_json::from_str::<Value>(raw).context("JSON 配置解析失败")?;
+    if let Some(items) = value.as_array() {
+        let mut profiles = Vec::new();
+        for (index, item) in items.iter().enumerate() {
+            let serialized = serde_json::to_string_pretty(item)?;
+            let path = persist_external_config(&serialized, storage_dir, prefix, "json")?;
+            profiles.push(build_external_profile(
+                &name_fn(item, index),
+                core_type.clone(),
+                external_format.clone(),
+                &path,
+            ));
+        }
+        return Ok(profiles);
+    }
+
+    let path = persist_external_config(raw, storage_dir, prefix, "json")?;
+    let derived_name = name_fn(&value, 0);
+    Ok(vec![build_external_profile(
+        if derived_name.trim().is_empty() { fallback_name } else { &derived_name },
+        core_type,
+        external_format,
+        &path,
+    )])
+}
+
 fn extract_json_outbound_names(raw: &str, field: &str) -> Result<Vec<String>> {
     let value = serde_json::from_str::<Value>(raw).context("JSON 配置解析失败")?;
-    Ok(value
-        .get("outbounds")
-        .and_then(Value::as_array)
+    Ok(extract_json_items(&value)
         .into_iter()
-        .flatten()
-        .filter_map(|item| item.get(field).and_then(Value::as_str).map(str::to_string))
+        .flat_map(|item| {
+            item.get("outbounds")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|outbound| outbound.get(field).and_then(Value::as_str).map(str::to_string))
+                .collect::<Vec<_>>()
+        })
         .collect())
 }
 
@@ -347,6 +394,58 @@ fn extract_clash_proxy_names(raw: &str) -> Result<Vec<String>> {
                 .map(str::to_string)
         })
         .collect())
+}
+
+fn extract_json_items<'a>(value: &'a Value) -> Vec<&'a Value> {
+    value.as_array().map(|items| items.iter().collect()).unwrap_or_else(|| vec![value])
+}
+
+fn json_contains_singbox_config(value: &Value) -> bool {
+    extract_json_items(value).into_iter().any(|item| {
+        item.get("inbounds").is_some() && item.get("outbounds").is_some() && item.get("route").is_some() && item.get("dns").is_some()
+    })
+}
+
+fn json_contains_xray_config(value: &Value) -> bool {
+    extract_json_items(value)
+        .into_iter()
+        .any(|item| item.get("inbounds").is_some() && item.get("outbounds").is_some() && item.get("routing").is_some())
+}
+
+fn yaml_is_clash_config(value: &serde_yaml::Value) -> bool {
+    let Some(mapping) = value.as_mapping() else {
+        return false;
+    };
+    let has_rules = mapping.contains_key(serde_yaml::Value::from("rules"));
+    let has_proxies = mapping.contains_key(serde_yaml::Value::from("proxies"));
+    let has_port = [
+        "port",
+        "socks-port",
+        "mixed-port",
+        "redir-port",
+        "tproxy-port",
+    ]
+    .iter()
+    .any(|key| mapping.contains_key(serde_yaml::Value::from(*key)));
+    has_rules && has_proxies && has_port
+}
+
+fn extract_json_profile_name(value: &Value, index: usize) -> String {
+    value
+        .get("remarks")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("tag").and_then(Value::as_str))
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("singbox_custom_{}", index + 1))
+}
+
+fn extract_xray_profile_name(value: &Value, index: usize) -> String {
+    value
+        .get("remarks")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("tag").and_then(Value::as_str))
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("v2ray_custom_{}", index + 1))
 }
 
 fn new_timestamp_suffix() -> u128 {

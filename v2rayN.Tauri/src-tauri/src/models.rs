@@ -148,6 +148,7 @@ pub struct Subscription {
     pub auto_update_interval_secs: Option<u64>,
     pub convert_core_target: Option<CoreType>,
     pub use_proxy_on_refresh: bool,
+    pub last_checked_at: Option<String>,
     pub last_synced_at: Option<String>,
     pub last_error: Option<String>,
 }
@@ -165,6 +166,7 @@ impl Default for Subscription {
             auto_update_interval_secs: None,
             convert_core_target: None,
             use_proxy_on_refresh: true,
+            last_checked_at: None,
             last_synced_at: None,
             last_error: None,
         }
@@ -278,6 +280,7 @@ impl Default for MuxSettings {
 pub struct ClashSettings {
     pub external_controller_port: u16,
     pub enable_ipv6: bool,
+    pub proxies_sorting: u8,
     pub proxies_auto_refresh: bool,
     pub proxies_auto_delay_test_interval: u16,
     pub connections_auto_refresh: bool,
@@ -289,6 +292,7 @@ impl Default for ClashSettings {
         Self {
             external_controller_port: 10813,
             enable_ipv6: false,
+            proxies_sorting: 0,
             proxies_auto_refresh: false,
             proxies_auto_delay_test_interval: 10,
             connections_auto_refresh: false,
@@ -390,6 +394,7 @@ pub struct ClashProxyGroup {
     pub proxy_type: String,
     pub now: Option<String>,
     pub all: Vec<String>,
+    pub last_delay_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

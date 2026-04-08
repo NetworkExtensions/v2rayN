@@ -47,6 +47,10 @@ export const desktopApi = {
   selectClashProxy: (groupName: string, proxyName: string) =>
     invoke<void>('select_clash_proxy', { groupName, proxyName }),
   getClashConnections: () => invoke<ClashConnection[]>('get_clash_connections'),
+  testClashProxyDelay: (groupName: string) =>
+    invoke<number>('test_clash_proxy_delay', { groupName }),
   onCoreLog: (handler: (event: CoreLogEvent) => void) =>
     listen<CoreLogEvent>('core-log', ({ payload }) => handler(payload)),
+  onAppStateChanged: (handler: (reason: string) => void) =>
+    listen<string>('app-state-changed', ({ payload }) => handler(payload)),
 }
