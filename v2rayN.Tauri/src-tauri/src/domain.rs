@@ -215,7 +215,7 @@ fn generate_sing_box_config(
 
     Ok(json!({
         "log": {
-            "level": "info",
+            "level": "warn",
             "timestamp": true,
         },
         "dns": singbox_dns_block(dns),
@@ -315,7 +315,7 @@ fn generate_tun_helper_sing_box_config(
 
     json!({
         "log": {
-            "level": "info",
+            "level": "warn",
             "timestamp": true
         },
         "dns": singbox_dns_block(dns),
