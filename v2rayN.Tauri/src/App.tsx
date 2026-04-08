@@ -1,7 +1,7 @@
 import type { ReactNode } from 'react'
 import { useEffect, useMemo, useState } from 'react'
 
-import { desktopApi, runtimeMode } from './lib/api'
+import { desktopApi } from './lib/api'
 import type {
   AppConfig,
   AppStatus,
@@ -32,7 +32,7 @@ function App() {
   const [preview, setPreview] = useState('')
   const [busyAction, setBusyAction] = useState<string | null>(null)
   const [message, setMessage] = useState<string>('')
-  const [loading, setLoading] = useState(true)
+  const [probeLoading, setProbeLoading] = useState(false)
 
   useEffect(() => {
     void loadStatus()
@@ -57,13 +57,28 @@ function App() {
       setSelectedProfileId(nextStatus.config.selected_profile_id ?? nextStatus.config.profiles[0]?.id ?? '')
       const generated = await desktopApi.generatePreview()
       setPreview(generated)
-      if (runtimeMode === 'browser') {
-        setMessage('当前运行在浏览器模式，使用本地 mock 数据；若要连接真实 Rust 后端，请使用 `npm run tauri dev`。')
-      }
+    } catch (error) {
+      setMessage(String(error))
+    }
+  }
+
+  async function syncRuntimeStatus() {
+    const nextStatus = await desktopApi.getStatus()
+    setStatus(nextStatus)
+    setConfig(nextStatus.config)
+    setSelectedProfileId(nextStatus.config.selected_profile_id ?? nextStatus.config.profiles[0]?.id ?? '')
+  }
+
+  async function refreshProbe() {
+    setProbeLoading(true)
+    try {
+      const probe = await desktopApi.probeCurrentOutbound()
+      setStatus((current) => (current ? { ...current, proxy_probe: probe } : current))
+      setMessage('出口信息已刷新')
     } catch (error) {
       setMessage(String(error))
     } finally {
-      setLoading(false)
+      setProbeLoading(false)
     }
   }
 
@@ -80,6 +95,31 @@ function App() {
     } finally {
       setBusyAction(null)
     }
+  }
+
+  function validateSelectedProfile(profile: Profile | null) {
+    if (!profile) {
+      return '请先选择一个节点'
+    }
+    if (!profile.server.trim()) {
+      return '节点地址不能为空'
+    }
+    if (!profile.port || profile.port <= 0 || profile.port > 65535) {
+      return '端口范围必须在 1-65535 之间'
+    }
+    if (['vless', 'vmess', 'tuic'].includes(profile.protocol) && !profile.uuid?.trim()) {
+      return '当前协议需要填写 UUID'
+    }
+    if (['trojan', 'shadowsocks', 'naive', 'anytls', 'hysteria2'].includes(profile.protocol) && !profile.password?.trim()) {
+      return '当前协议需要填写密码'
+    }
+    if (profile.protocol === 'shadowsocks' && !profile.method?.trim()) {
+      return 'Shadowsocks 需要填写加密方法'
+    }
+    if (profile.security === 'reality' && !profile.reality_public_key?.trim()) {
+      return 'REALITY 模式需要填写 public key'
+    }
+    return null
   }
 
   function updateConfig(mutator: (draft: AppConfig) => void) {
@@ -172,12 +212,18 @@ function App() {
   }
 
   async function handleStart() {
+    const validationError = validateSelectedProfile(selectedProfile)
+    if (validationError) {
+      setMessage(validationError)
+      return
+    }
     setBusyAction('start')
     try {
-      const runtime = await desktopApi.startCore()
-      setStatus((current) => (current ? { ...current, runtime } : current))
+      await desktopApi.startCore()
+      await syncRuntimeStatus()
       setMessage('核心已启动')
       setPreview(await desktopApi.generatePreview())
+      await refreshProbe()
     } catch (error) {
       setMessage(String(error))
     } finally {
@@ -188,9 +234,30 @@ function App() {
   async function handleStop() {
     setBusyAction('stop')
     try {
-      const runtime = await desktopApi.stopCore()
-      setStatus((current) => (current ? { ...current, runtime } : current))
+      await desktopApi.stopCore()
+      await syncRuntimeStatus()
       setMessage('核心已停止')
+      await refreshProbe()
+    } catch (error) {
+      setMessage(String(error))
+    } finally {
+      setBusyAction(null)
+    }
+  }
+
+  async function handleRestart() {
+    const validationError = validateSelectedProfile(selectedProfile)
+    if (validationError) {
+      setMessage(validationError)
+      return
+    }
+    setBusyAction('restart')
+    try {
+      await desktopApi.restartCore()
+      await syncRuntimeStatus()
+      setMessage('核心已重启')
+      setPreview(await desktopApi.generatePreview())
+      await refreshProbe()
     } catch (error) {
       setMessage(String(error))
     } finally {
@@ -205,6 +272,7 @@ function App() {
         ? await desktopApi.enableSystemProxy()
         : await desktopApi.disableSystemProxy()
       setConfig(nextConfig)
+      await syncRuntimeStatus()
       setMessage(enabled ? '系统代理已开启' : '系统代理已关闭')
     } catch (error) {
       setMessage(String(error))
@@ -213,32 +281,8 @@ function App() {
     }
   }
 
-  if (loading) {
-    return <div className="flex min-h-screen items-center justify-center bg-slate-950 text-slate-100">正在加载应用状态...</div>
-  }
-
   if (!config || !status) {
-    return (
-      <div className="flex min-h-screen items-center justify-center bg-slate-950 px-6 text-slate-100">
-        <div className="max-w-xl rounded-3xl border border-rose-500/30 bg-slate-900 p-6 shadow-2xl shadow-slate-950/30">
-          <h1 className="text-xl font-semibold">应用状态加载失败</h1>
-          <p className="mt-3 text-sm text-slate-300">{message || '未获取到初始化状态。'}</p>
-          <p className="mt-3 text-sm text-slate-400">
-            如果你是在浏览器里直接跑 `npm run dev`，建议改为 `npm run tauri dev`，或等待浏览器模式 fallback 生效后再刷新页面。
-          </p>
-          <button
-            className="mt-5 rounded-xl bg-violet-500 px-4 py-2 text-sm font-medium text-white"
-            onClick={() => {
-              setLoading(true)
-              setMessage('')
-              void loadStatus()
-            }}
-          >
-            重新加载
-          </button>
-        </div>
-      </div>
-    )
+    return <div className="flex min-h-screen items-center justify-center bg-slate-950 text-slate-100">正在加载应用状态...</div>
   }
 
   const addProfile = () => {
@@ -294,9 +338,6 @@ function App() {
             <p className="text-xs uppercase tracking-[0.3em] text-violet-300">v2rayN</p>
             <h1 className="mt-3 text-2xl font-semibold">Tauri 重构版</h1>
             <p className="mt-2 text-sm text-slate-400">Rust 负责运行时，React 负责交互与可视化。</p>
-            <span className="mt-3 inline-flex rounded-full border border-slate-700 px-2 py-1 text-[11px] text-slate-300">
-              {runtimeMode === 'tauri' ? 'Tauri Runtime' : 'Browser Mock Runtime'}
-            </span>
           </div>
           <nav className="space-y-2">
             {tabs.map((tab) => (
@@ -331,15 +372,19 @@ function App() {
               </p>
             </div>
             <div className="flex flex-wrap gap-3">
-              <button className="rounded-xl bg-violet-500 px-4 py-2 text-sm font-medium text-white" onClick={handleStart}>
-                启动核心
+              <button className="rounded-xl bg-violet-500 px-4 py-2 text-sm font-medium text-white disabled:cursor-not-allowed disabled:bg-slate-700" onClick={handleStart} disabled={busyAction !== null}>
+                {busyAction === 'start' ? '启动中...' : '启动核心'}
               </button>
-              <button className="rounded-xl border border-slate-700 px-4 py-2 text-sm text-slate-200" onClick={handleStop}>
-                停止核心
+              <button className="rounded-xl border border-slate-700 px-4 py-2 text-sm text-slate-200 disabled:cursor-not-allowed disabled:text-slate-500" onClick={handleStop} disabled={busyAction !== null}>
+                {busyAction === 'stop' ? '停止中...' : '停止核心'}
+              </button>
+              <button className="rounded-xl border border-slate-700 px-4 py-2 text-sm text-slate-200 disabled:cursor-not-allowed disabled:text-slate-500" onClick={handleRestart} disabled={busyAction !== null}>
+                {busyAction === 'restart' ? '重启中...' : '重启核心'}
               </button>
               <button
-                className="rounded-xl border border-slate-700 px-4 py-2 text-sm text-slate-200"
+                className="rounded-xl border border-slate-700 px-4 py-2 text-sm text-slate-200 disabled:cursor-not-allowed disabled:text-slate-500"
                 onClick={() => void persistConfig(config, '配置已保存')}
+                disabled={busyAction !== null}
               >
                 保存配置
               </button>
@@ -360,7 +405,6 @@ function App() {
                     <CoreCard
                       key={asset.core_type}
                       asset={asset}
-                      installDirectory={`${status.paths.bin}/${asset.core_type}`}
                       busy={busyAction === `download-${asset.core_type}`}
                       onDownload={() => void handleCoreDownload(asset.core_type)}
                     />
@@ -373,8 +417,29 @@ function App() {
                   <KeyValue label="核心类型" value={status.runtime.core_type ?? '未启动'} />
                   <KeyValue label="配置文件" value={status.runtime.config_path ?? '-'} mono />
                   <KeyValue label="执行文件" value={status.runtime.executable_path ?? '-'} mono />
+                  <KeyValue label="主进程 PID" value={status.runtime.pid ? String(status.runtime.pid) : '-'} />
+                  <KeyValue label="提权启动" value={status.runtime.elevated ? '是' : '否'} />
+                  <KeyValue label="辅助核心" value={status.runtime.helper_core_type ?? '-'} />
+                  <KeyValue label="辅助配置" value={status.runtime.helper_config_path ?? '-'} mono />
+                  <KeyValue label="辅助 PID" value={status.runtime.helper_pid ? String(status.runtime.helper_pid) : '-'} />
                   <KeyValue label="系统代理" value={config.proxy.use_system_proxy ? '已开启' : '未开启'} />
                   <KeyValue label="TUN 模式" value={config.tun.enabled ? '已开启' : '未开启'} />
+                </div>
+              </SectionCard>
+
+              <SectionCard
+                title="出口探测"
+                action={
+                  <ActionButton busy={probeLoading} onClick={() => void refreshProbe()}>
+                    刷新出口
+                  </ActionButton>
+                }
+              >
+                <div className="space-y-3 text-sm text-slate-300">
+                  <KeyValue label="出口 IP" value={status.proxy_probe?.outbound_ip ?? '-'} />
+                  <KeyValue label="国家" value={status.proxy_probe?.country ?? '-'} />
+                  <KeyValue label="城市" value={status.proxy_probe?.city ?? '-'} />
+                  <KeyValue label="运营商" value={status.proxy_probe?.isp ?? '-'} />
                 </div>
               </SectionCard>
 
@@ -417,9 +482,10 @@ function App() {
                       }`}
                       onClick={() => {
                         setSelectedProfileId(profile.id)
-                        updateConfig((draft) => {
-                          draft.selected_profile_id = profile.id
-                        })
+                        void desktopApi
+                          .selectProfile(profile.id)
+                          .then((nextConfig) => setConfig(nextConfig))
+                          .catch((error) => setMessage(String(error)))
                       }}
                     >
                       <p className="font-medium text-slate-100">{profile.name}</p>
@@ -429,6 +495,21 @@ function App() {
                       <p className="mt-2 text-sm text-slate-400">
                         {profile.server}:{profile.port}
                       </p>
+                      <button
+                        className="mt-3 rounded-lg border border-slate-700 px-2 py-1 text-xs text-slate-300 hover:border-rose-400 hover:text-rose-200"
+                        onClick={(event) => {
+                          event.stopPropagation()
+                          void desktopApi
+                            .removeProfile(profile.id)
+                            .then((nextConfig) => {
+                              setConfig(nextConfig)
+                              setSelectedProfileId(nextConfig.selected_profile_id ?? nextConfig.profiles[0]?.id ?? '')
+                            })
+                            .catch((error) => setMessage(String(error)))
+                        }}
+                      >
+                        删除
+                      </button>
                     </button>
                   ))}
                 </div>
@@ -452,6 +533,11 @@ function App() {
                         <option value="vmess">VMess</option>
                         <option value="trojan">Trojan</option>
                         <option value="shadowsocks">Shadowsocks</option>
+                        <option value="hysteria2">Hysteria2</option>
+                        <option value="tuic">TUIC</option>
+                        <option value="naive">Naive</option>
+                        <option value="anytls">AnyTLS</option>
+                        <option value="wire_guard">WireGuard</option>
                       </select>
                     </Field>
                     <Field label="地址">
@@ -514,7 +600,30 @@ function App() {
           ) : null}
 
           {activeTab === 'subscriptions' ? (
-            <SectionCard title="订阅管理" action={<button className="rounded-xl border border-slate-700 px-3 py-2 text-sm" onClick={addSubscription}>新增订阅</button>}>
+            <SectionCard
+              title="订阅管理"
+              action={
+                <div className="flex gap-2">
+                  <button className="rounded-xl border border-slate-700 px-3 py-2 text-sm" onClick={addSubscription}>新增订阅</button>
+                  <button
+                    className="rounded-xl border border-slate-700 px-3 py-2 text-sm"
+                    onClick={() => {
+                      setBusyAction('subscription-refresh-all')
+                      void desktopApi
+                        .refreshAllSubscriptions('sing_box')
+                        .then((nextConfig) => {
+                          setConfig(nextConfig)
+                          setMessage('全部订阅刷新完成')
+                        })
+                        .catch((error) => setMessage(String(error)))
+                        .finally(() => setBusyAction(null))
+                    }}
+                  >
+                    {busyAction === 'subscription-refresh-all' ? '刷新中...' : '刷新全部'}
+                  </button>
+                </div>
+              }
+            >
               <div className="space-y-4">
                 {config.subscriptions.length === 0 ? (
                   <div className="rounded-2xl border border-dashed border-slate-700 p-6 text-sm text-slate-400">
@@ -555,6 +664,17 @@ function App() {
                         <ActionButton busy={busyAction === `subscription-refresh-${subscription.id}`} onClick={() => void handleRefreshSubscription(subscription.id, 'sing_box')}>
                           刷新
                         </ActionButton>
+                        <button
+                          className="rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200"
+                          onClick={() => {
+                            void desktopApi
+                              .removeSubscription(subscription.id)
+                              .then((nextConfig) => setConfig(nextConfig))
+                              .catch((error) => setMessage(String(error)))
+                          }}
+                        >
+                          删除
+                        </button>
                       </div>
                     </div>
                     <p className="mt-3 text-xs text-slate-400">最近同步：{subscription.last_synced_at ?? '未同步'}</p>
@@ -696,12 +816,10 @@ function KeyValue({ label, value, mono }: { label: string; value: string; mono?:
 
 function CoreCard({
   asset,
-  installDirectory,
   busy,
   onDownload,
 }: {
   asset: CoreAssetStatus
-  installDirectory: string
   busy: boolean
   onDownload: () => void
 }) {
@@ -712,10 +830,6 @@ function CoreCard({
       </p>
       <p className="mt-2 text-sm text-slate-400">已安装：{asset.installed_version ?? '未安装'}</p>
       <p className="mt-1 text-sm text-slate-400">最新：{asset.latest_version ?? '未知'}</p>
-      <p className="mt-3 text-xs text-slate-500">下载地址</p>
-      <p className="mt-1 break-all font-mono text-[11px] text-slate-400">{asset.download_url ?? '尚未解析到下载链接'}</p>
-      <p className="mt-3 text-xs text-slate-500">安装目录</p>
-      <p className="mt-1 break-all font-mono text-[11px] text-slate-400">{installDirectory}</p>
       <p className="mt-2 break-all font-mono text-[11px] text-slate-500">{asset.executable_path ?? '尚无可执行文件'}</p>
       <ActionButton busy={busy} onClick={onDownload} className="mt-4 w-full justify-center">
         下载 / 更新

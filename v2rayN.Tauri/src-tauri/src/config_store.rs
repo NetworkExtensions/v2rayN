@@ -1,6 +1,6 @@
 use crate::models::{AppConfig, AppPaths};
 use anyhow::{Context, Result};
-use std::{fs, path::PathBuf};
+use std::{fs, path::{Path, PathBuf}};
 use tauri::{AppHandle, Manager};
 
 #[derive(Debug, Clone)]
@@ -29,6 +29,7 @@ impl ConfigStore {
         }
 
         let store = Self { paths };
+        migrate_legacy_binaries(&store.paths)?;
         if !PathBuf::from(&store.paths.state_file).exists() {
             store.save(&AppConfig::default())?;
         }
@@ -54,6 +55,68 @@ impl ConfigStore {
         normalize_config(&mut config);
         Ok(config)
     }
+}
+
+fn migrate_legacy_binaries(paths: &AppPaths) -> Result<()> {
+    let current_bin = PathBuf::from(&paths.bin);
+    copy_root_bins_into_core_dirs(&current_bin)?;
+
+    let Some(root_parent) = Path::new(&paths.root).parent() else {
+        return Ok(());
+    };
+
+    for legacy_dir_name in ["com.tauri.dev", "com.dywang.v2rayn.tauri"] {
+        let legacy_root = root_parent.join(legacy_dir_name);
+        let legacy_bin = legacy_root.join("bin");
+        if !legacy_bin.exists() || legacy_bin == current_bin {
+            continue;
+        }
+        copy_binary_if_needed(&legacy_bin.join("xray"), &current_bin.join("xray").join("xray"))?;
+        copy_binary_if_needed(&legacy_bin.join("sing-box"), &current_bin.join("sing_box").join("sing-box"))?;
+        copy_binary_if_needed(&legacy_bin.join("sing-box-client"), &current_bin.join("sing_box").join("sing-box-client"))?;
+    }
+
+    Ok(())
+}
+
+fn copy_root_bins_into_core_dirs(bin_root: &Path) -> Result<()> {
+    copy_binary_if_needed(&bin_root.join("xray"), &bin_root.join("xray").join("xray"))?;
+    copy_binary_if_needed(&bin_root.join("sing-box"), &bin_root.join("sing_box").join("sing-box"))?;
+    copy_binary_if_needed(
+        &bin_root.join("sing-box-client"),
+        &bin_root.join("sing_box").join("sing-box-client"),
+    )?;
+    Ok(())
+}
+
+fn copy_binary_if_needed(source: &Path, destination: &Path) -> Result<()> {
+    if !source.exists() || destination.exists() {
+        return Ok(());
+    }
+
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("创建核心目录失败: {}", parent.display()))?;
+    }
+
+    fs::copy(source, destination).with_context(|| {
+        format!(
+            "复制旧核心失败: {} -> {}",
+            source.display(),
+            destination.display()
+        )
+    })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = fs::metadata(destination)?;
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(destination, permissions)?;
+    }
+
+    Ok(())
 }
 
 fn normalize_config(config: &mut AppConfig) {

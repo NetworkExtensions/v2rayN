@@ -29,6 +29,11 @@ pub enum ProfileProtocol {
     Vmess,
     Trojan,
     Shadowsocks,
+    Hysteria2,
+    Tuic,
+    WireGuard,
+    Naive,
+    Anytls,
 }
 
 impl Default for ProfileProtocol {
@@ -148,7 +153,7 @@ impl Default for TunSettings {
     fn default() -> Self {
         Self {
             enabled: false,
-            interface_name: "utun233".into(),
+            interface_name: String::new(),
             mtu: 9000,
             auto_route: true,
             strict_route: false,
@@ -227,6 +232,11 @@ pub struct RunningStatus {
     pub profile_id: Option<String>,
     pub executable_path: Option<String>,
     pub config_path: Option<String>,
+    pub pid: Option<u32>,
+    pub elevated: bool,
+    pub helper_core_type: Option<CoreType>,
+    pub helper_config_path: Option<String>,
+    pub helper_pid: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -251,6 +261,15 @@ pub struct AppStatus {
     pub config: AppConfig,
     pub runtime: RunningStatus,
     pub core_assets: Vec<CoreAssetStatus>,
+    pub proxy_probe: Option<ProxyProbe>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyProbe {
+    pub outbound_ip: String,
+    pub country: Option<String>,
+    pub city: Option<String>,
+    pub isp: Option<String>,
 }
 
 pub fn new_id(prefix: &str) -> String {

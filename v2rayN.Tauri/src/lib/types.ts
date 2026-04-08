@@ -1,5 +1,14 @@
 export type CoreType = 'xray' | 'sing_box'
-export type ProfileProtocol = 'vless' | 'vmess' | 'trojan' | 'shadowsocks'
+export type ProfileProtocol =
+  | 'vless'
+  | 'vmess'
+  | 'trojan'
+  | 'shadowsocks'
+  | 'hysteria2'
+  | 'tuic'
+  | 'wire_guard'
+  | 'naive'
+  | 'anytls'
 
 export interface Profile {
   id: string
@@ -84,6 +93,11 @@ export interface RunningStatus {
   profile_id?: string | null
   executable_path?: string | null
   config_path?: string | null
+  pid?: number | null
+  elevated: boolean
+  helper_core_type?: CoreType | null
+  helper_config_path?: string | null
+  helper_pid?: number | null
 }
 
 export interface CoreAssetStatus {
@@ -99,10 +113,18 @@ export interface AppStatus {
   config: AppConfig
   runtime: RunningStatus
   core_assets: CoreAssetStatus[]
+  proxy_probe?: ProxyProbe | null
 }
 
 export interface CoreLogEvent {
   level: string
   source: string
   message: string
+}
+
+export interface ProxyProbe {
+  outbound_ip: string
+  country?: string | null
+  city?: string | null
+  isp?: string | null
 }

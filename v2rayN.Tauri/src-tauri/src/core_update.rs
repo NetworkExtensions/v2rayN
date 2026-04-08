@@ -51,19 +51,7 @@ pub fn download_core(app: &AppHandle, core_paths: &CorePaths, core_type: CoreTyp
     let asset = select_asset(&core_type, &release.assets)?;
     let directory = core_paths.executable_dir(&core_type);
     fs::create_dir_all(&directory)?;
-    log::info!(
-        "downloading core asset: core_type={}, url={}, install_dir={}",
-        core_type.key(),
-        asset.browser_download_url,
-        directory.display()
-    );
-    install_asset(&asset.browser_download_url, &directory, &core_type).with_context(|| {
-        format!(
-            "核心下载或解压失败。url={}, install_dir={}",
-            asset.browser_download_url,
-            directory.display()
-        )
-    })?;
+    install_asset(&asset.browser_download_url, &directory, &core_type)?;
 
     core_status(core_paths, core_type).map(|mut status| {
         status.latest_version = Some(release.tag_name);
@@ -106,10 +94,6 @@ fn fetch_release(core_type: &CoreType) -> Result<GithubRelease> {
 fn github_client() -> Result<Client> {
     Client::builder()
         .user_agent("v2rayN-tauri")
-        .no_gzip()
-        .no_brotli()
-        .no_deflate()
-        .no_zstd()
         .build()
         .context("创建 GitHub 客户端失败")
 }
@@ -136,17 +120,9 @@ fn select_asset(core_type: &CoreType, assets: &[GithubAsset]) -> Result<GithubAs
 fn install_asset(url: &str, target_dir: &Path, core_type: &CoreType) -> Result<()> {
     let client = github_client()?;
     let bytes = client.get(url).send()?.error_for_status()?.bytes()?;
-    let len = bytes.len();
-    let magic = bytes
-        .iter()
-        .take(8)
-        .map(|byte| format!("{byte:02X}"))
-        .collect::<Vec<_>>()
-        .join(" ");
 
     if url.ends_with(".zip") {
-        let mut archive = ZipArchive::new(Cursor::new(bytes))
-            .with_context(|| format!("无法解析 ZIP 压缩包，bytes={len}, magic={magic}"))?;
+        let mut archive = ZipArchive::new(Cursor::new(bytes))?;
         for index in 0..archive.len() {
             let mut file = archive.by_index(index)?;
             if file.is_dir() {
@@ -164,9 +140,7 @@ fn install_asset(url: &str, target_dir: &Path, core_type: &CoreType) -> Result<(
         let reader = Cursor::new(bytes);
         let gz = GzDecoder::new(reader);
         let mut archive = Archive::new(gz);
-        archive
-            .unpack(target_dir)
-            .with_context(|| format!("无法解压 tar.gz 压缩包，bytes={len}, magic={magic}"))?;
+        archive.unpack(target_dir)?;
         flatten_single_directory(target_dir)?;
         let executable = resolve_executable_path(target_dir, core_type);
         if let Some(path) = executable {
@@ -205,7 +179,7 @@ pub fn resolve_executable(core_paths: &CorePaths, core_type: &CoreType) -> Optio
 fn resolve_executable_path(directory: &Path, core_type: &CoreType) -> Option<PathBuf> {
     let names = match core_type {
         CoreType::Xray => vec!["xray"],
-        CoreType::SingBox => vec!["sing-box", "sing-box-client", "sing_box"],
+        CoreType::SingBox => vec!["sing-box", "sing-box-client"],
     };
 
     names

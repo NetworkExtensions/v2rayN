@@ -2,19 +2,21 @@
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "v2rayN Tauri",
   "version": "0.1.0",
-  "identifier": "com.tauri.dev",
+  "identifier": "com.dywang.v2rayn.tauri",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
-    "beforeDevCommand": "npm run dev -- --host 0.0.0.0 --port 1420",
+    "beforeDevCommand": "npm run dev",
     "beforeBuildCommand": "npm run build"
   },
   "app": {
     "windows": [
       {
         "title": "v2rayN Tauri",
-        "width": 800,
-        "height": 600,
+        "width": 1440,
+        "height": 920,
+        "minWidth": 1180,
+        "minHeight": 760,
         "resizable": true,
         "fullscreen": false
       }
