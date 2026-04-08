@@ -5,20 +5,24 @@ import { desktopApi } from './lib/api'
 import type {
   AppConfig,
   AppStatus,
+  ClashConnection,
+  ClashProxyGroup,
   CoreAssetStatus,
   CoreLogEvent,
   CoreType,
+  ImportPreview,
   Profile,
   Subscription,
 } from './lib/types'
 
-type TabKey = 'overview' | 'profiles' | 'subscriptions' | 'settings' | 'logs'
+type TabKey = 'overview' | 'profiles' | 'subscriptions' | 'settings' | 'clash' | 'logs'
 
 const tabs: Array<{ key: TabKey; label: string }> = [
   { key: 'overview', label: '总览' },
   { key: 'profiles', label: '节点' },
   { key: 'subscriptions', label: '订阅' },
   { key: 'settings', label: '设置' },
+  { key: 'clash', label: 'Clash' },
   { key: 'logs', label: '日志' },
 ]
 
@@ -33,6 +37,9 @@ function App() {
   const [busyAction, setBusyAction] = useState<string | null>(null)
   const [message, setMessage] = useState<string>('')
   const [probeLoading, setProbeLoading] = useState(false)
+  const [lastImportPreview, setLastImportPreview] = useState<ImportPreview | null>(null)
+  const [clashProxyGroups, setClashProxyGroups] = useState<ClashProxyGroup[]>([])
+  const [clashConnections, setClashConnections] = useState<ClashConnection[]>([])
 
   useEffect(() => {
     void loadStatus()
@@ -48,6 +55,12 @@ function App() {
   const selectedProfile = useMemo(() => {
     return config?.profiles.find((profile) => profile.id === selectedProfileId) ?? null
   }, [config, selectedProfileId])
+
+  useEffect(() => {
+    if (activeTab === 'clash' && status?.runtime.running && status.runtime.core_type === 'mihomo') {
+      void refreshClashState()
+    }
+  }, [activeTab, status?.runtime.running, status?.runtime.core_type])
 
   async function loadStatus() {
     try {
@@ -67,6 +80,7 @@ function App() {
     setStatus(nextStatus)
     setConfig(nextStatus.config)
     setSelectedProfileId(nextStatus.config.selected_profile_id ?? nextStatus.config.profiles[0]?.id ?? '')
+    return nextStatus
   }
 
   async function refreshProbe() {
@@ -79,6 +93,19 @@ function App() {
       setMessage(String(error))
     } finally {
       setProbeLoading(false)
+    }
+  }
+
+  async function refreshClashState() {
+    try {
+      const [groups, connections] = await Promise.all([
+        desktopApi.getClashProxyGroups(),
+        desktopApi.getClashConnections(),
+      ])
+      setClashProxyGroups(groups)
+      setClashConnections(connections)
+    } catch (error) {
+      setMessage(String(error))
     }
   }
 
@@ -100,6 +127,12 @@ function App() {
   function validateSelectedProfile(profile: Profile | null) {
     if (!profile) {
       return '请先选择一个节点'
+    }
+    if (profile.config_type === 'external') {
+      if (!profile.external_config_path?.trim()) {
+        return '外部配置节点必须指定配置文件路径'
+      }
+      return null
     }
     if (!profile.server.trim()) {
       return '节点地址不能为空'
@@ -153,7 +186,35 @@ function App() {
       setConfig(nextConfig)
       setSelectedProfileId(nextConfig.selected_profile_id ?? nextConfig.profiles[0]?.id ?? '')
       setImportText('')
+      setLastImportPreview(null)
       setMessage('导入成功')
+      setPreview(await desktopApi.generatePreview())
+    } catch (error) {
+      setMessage(String(error))
+    } finally {
+      setBusyAction(null)
+    }
+  }
+
+  async function handleImportFullConfig() {
+    if (!importText.trim()) {
+      setMessage('请输入完整配置内容')
+      return
+    }
+
+    setBusyAction('import-full')
+    try {
+      const previewResult = await desktopApi.previewImport(importText, 'sing_box')
+      setLastImportPreview(previewResult)
+      if (!previewResult.stores_as_external) {
+        setMessage(previewResult.message ?? '当前内容更适合用分享链接导入')
+        return
+      }
+      const nextConfig = await desktopApi.importFullConfig(importText)
+      setConfig(nextConfig)
+      setSelectedProfileId(nextConfig.selected_profile_id ?? nextConfig.profiles[0]?.id ?? '')
+      setImportText('')
+      setMessage(previewResult.message ?? '完整配置导入成功')
       setPreview(await desktopApi.generatePreview())
     } catch (error) {
       setMessage(String(error))
@@ -220,10 +281,13 @@ function App() {
     setBusyAction('start')
     try {
       await desktopApi.startCore()
-      await syncRuntimeStatus()
+      const nextStatus = await syncRuntimeStatus()
       setMessage('核心已启动')
       setPreview(await desktopApi.generatePreview())
       await refreshProbe()
+      if (nextStatus.runtime.core_type === 'mihomo') {
+        await refreshClashState()
+      }
     } catch (error) {
       setMessage(String(error))
     } finally {
@@ -237,6 +301,8 @@ function App() {
       await desktopApi.stopCore()
       await syncRuntimeStatus()
       setMessage('核心已停止')
+      setClashProxyGroups([])
+      setClashConnections([])
       await refreshProbe()
     } catch (error) {
       setMessage(String(error))
@@ -254,10 +320,13 @@ function App() {
     setBusyAction('restart')
     try {
       await desktopApi.restartCore()
-      await syncRuntimeStatus()
+      const nextStatus = await syncRuntimeStatus()
       setMessage('核心已重启')
       setPreview(await desktopApi.generatePreview())
       await refreshProbe()
+      if (nextStatus.runtime.core_type === 'mihomo') {
+        await refreshClashState()
+      }
     } catch (error) {
       setMessage(String(error))
     } finally {
@@ -274,6 +343,19 @@ function App() {
       setConfig(nextConfig)
       await syncRuntimeStatus()
       setMessage(enabled ? '系统代理已开启' : '系统代理已关闭')
+    } catch (error) {
+      setMessage(String(error))
+    } finally {
+      setBusyAction(null)
+    }
+  }
+
+  async function handleClashProxySelect(groupName: string, proxyName: string) {
+    setBusyAction(`clash-proxy-${groupName}`)
+    try {
+      await desktopApi.selectClashProxy(groupName, proxyName)
+      await refreshClashState()
+      setMessage(`已切换 ${groupName} -> ${proxyName}`)
     } catch (error) {
       setMessage(String(error))
     } finally {
@@ -309,6 +391,11 @@ function App() {
       reality_short_id: '',
       alpn: [],
       udp: true,
+      mux_override: 'follow_global',
+      source_subscription_id: null,
+      config_type: 'native',
+      external_config_format: null,
+      external_config_path: null,
     }
     updateConfig((draft) => {
       draft.profiles.push(profile)
@@ -323,7 +410,14 @@ function App() {
       name: `订阅 ${config.subscriptions.length + 1}`,
       url: '',
       enabled: true,
+      more_urls: [],
+      user_agent: 'v2rayN-tauri',
+      filter: '',
+      auto_update_interval_secs: null,
+      convert_core_target: null,
+      use_proxy_on_refresh: true,
       last_synced_at: null,
+      last_error: null,
     }
     updateConfig((draft) => {
       draft.subscriptions.push(subscription)
@@ -454,16 +548,26 @@ function App() {
                   value={importText}
                   onChange={(event) => setImportText(event.target.value)}
                   className="h-60 w-full rounded-2xl border border-slate-700 bg-slate-950 px-4 py-3 text-sm outline-none"
-                  placeholder="粘贴 vless:// vmess:// trojan:// ss:// 分享链接，一行一个"
+                  placeholder="粘贴分享链接、sing-box/Xray JSON 或 Clash YAML"
                 />
-                <div className="mt-4 flex gap-3">
+                <div className="mt-4 flex flex-wrap gap-3">
                   <ActionButton busy={busyAction === 'import'} onClick={() => void handleImport('sing_box')}>
                     导入为 sing-box 节点
                   </ActionButton>
                   <ActionButton busy={busyAction === 'import'} onClick={() => void handleImport('xray')}>
                     导入为 Xray 节点
                   </ActionButton>
+                  <ActionButton busy={busyAction === 'import-full'} onClick={() => void handleImportFullConfig()}>
+                    自动识别完整配置
+                  </ActionButton>
                 </div>
+                {lastImportPreview ? (
+                  <div className="mt-4 rounded-2xl border border-slate-800 bg-slate-950/70 p-4 text-sm text-slate-300">
+                    <p>最近识别：{lastImportPreview.format}</p>
+                    <p className="mt-1">结果：{lastImportPreview.message ?? '-'}</p>
+                    <p className="mt-1">预览项：{lastImportPreview.profile_names.join(', ') || '无'}</p>
+                  </div>
+                ) : null}
               </SectionCard>
             </div>
           ) : null}
@@ -490,10 +594,12 @@ function App() {
                     >
                       <p className="font-medium text-slate-100">{profile.name}</p>
                       <p className="mt-1 text-xs uppercase tracking-wide text-slate-400">
-                        {profile.protocol} · {profile.core_type}
+                        {profile.config_type === 'external' ? 'external' : profile.protocol} · {profile.core_type}
                       </p>
                       <p className="mt-2 text-sm text-slate-400">
-                        {profile.server}:{profile.port}
+                        {profile.config_type === 'external'
+                          ? (profile.external_config_path ?? '未设置外部配置')
+                          : `${profile.server}:${profile.port}`}
                       </p>
                       <button
                         className="mt-3 rounded-lg border border-slate-700 px-2 py-1 text-xs text-slate-300 hover:border-rose-400 hover:text-rose-200"
@@ -525,8 +631,67 @@ function App() {
                       <select value={selectedProfile.core_type} onChange={(event) => updateSelectedProfile((profile) => { profile.core_type = event.target.value as CoreType })}>
                         <option value="sing_box">sing-box</option>
                         <option value="xray">Xray</option>
+                        <option value="mihomo">mihomo</option>
                       </select>
                     </Field>
+                    <Field label="配置类型">
+                      <select
+                        value={selectedProfile.config_type}
+                        onChange={(event) =>
+                          updateSelectedProfile((profile) => {
+                            profile.config_type = event.target.value as Profile['config_type']
+                          })
+                        }
+                      >
+                        <option value="native">native</option>
+                        <option value="external">external</option>
+                      </select>
+                    </Field>
+                    <Field label="Mux 覆盖">
+                      <select
+                        value={selectedProfile.mux_override}
+                        onChange={(event) =>
+                          updateSelectedProfile((profile) => {
+                            profile.mux_override = event.target.value as Profile['mux_override']
+                          })
+                        }
+                      >
+                        <option value="follow_global">跟随全局</option>
+                        <option value="force_enable">强制开启</option>
+                        <option value="force_disable">强制关闭</option>
+                      </select>
+                    </Field>
+                    {selectedProfile.config_type === 'external' ? (
+                      <>
+                        <Field label="外部配置格式">
+                          <select
+                            value={selectedProfile.external_config_format ?? 'clash'}
+                            onChange={(event) =>
+                              updateSelectedProfile((profile) => {
+                                profile.external_config_format = event.target.value as NonNullable<
+                                  Profile['external_config_format']
+                                >
+                              })
+                            }
+                          >
+                            <option value="sing_box">sing-box JSON</option>
+                            <option value="xray">Xray JSON</option>
+                            <option value="clash">Clash YAML</option>
+                          </select>
+                        </Field>
+                        <Field label="外部配置路径">
+                          <input
+                            value={selectedProfile.external_config_path ?? ''}
+                            onChange={(event) =>
+                              updateSelectedProfile((profile) => {
+                                profile.external_config_path = event.target.value
+                              })
+                            }
+                          />
+                        </Field>
+                      </>
+                    ) : (
+                      <>
                     <Field label="协议">
                       <select value={selectedProfile.protocol} onChange={(event) => updateSelectedProfile((profile) => { profile.protocol = event.target.value as Profile['protocol'] })}>
                         <option value="vless">VLESS</option>
@@ -593,6 +758,8 @@ function App() {
                     <Field label="Reality Short ID">
                       <input value={selectedProfile.reality_short_id ?? ''} onChange={(event) => updateSelectedProfile((profile) => { profile.reality_short_id = event.target.value })} />
                     </Field>
+                      </>
+                    )}
                   </div>
                 ) : null}
               </SectionCard>
@@ -632,7 +799,7 @@ function App() {
                 ) : null}
                 {config.subscriptions.map((subscription) => (
                   <div key={subscription.id} className="rounded-2xl border border-slate-800 bg-slate-900/60 p-4">
-                    <div className="grid gap-4 md:grid-cols-[1fr_2fr_auto]">
+                    <div className="grid gap-4 md:grid-cols-2">
                       <Field label="订阅名称">
                         <input
                           value={subscription.name}
@@ -657,6 +824,106 @@ function App() {
                           }}
                         />
                       </Field>
+                      <Field label="附加 URL（逗号分隔）">
+                        <input
+                          value={subscription.more_urls.join(',')}
+                          onChange={(event) => {
+                            const next = {
+                              ...subscription,
+                              more_urls: event.target.value
+                                .split(',')
+                                .map((item) => item.trim())
+                                .filter(Boolean),
+                            }
+                            updateConfig((draft) => {
+                              const target = draft.subscriptions.find((item) => item.id === subscription.id)
+                              if (target) Object.assign(target, next)
+                            })
+                          }}
+                        />
+                      </Field>
+                      <Field label="User-Agent">
+                        <input
+                          value={subscription.user_agent}
+                          onChange={(event) => {
+                            const next = { ...subscription, user_agent: event.target.value }
+                            updateConfig((draft) => {
+                              const target = draft.subscriptions.find((item) => item.id === subscription.id)
+                              if (target) Object.assign(target, next)
+                            })
+                          }}
+                        />
+                      </Field>
+                      <Field label="节点过滤正则">
+                        <input
+                          value={subscription.filter ?? ''}
+                          onChange={(event) => {
+                            const next = { ...subscription, filter: event.target.value }
+                            updateConfig((draft) => {
+                              const target = draft.subscriptions.find((item) => item.id === subscription.id)
+                              if (target) Object.assign(target, next)
+                            })
+                          }}
+                        />
+                      </Field>
+                      <Field label="自动更新间隔（秒）">
+                        <input
+                          type="number"
+                          value={subscription.auto_update_interval_secs ?? ''}
+                          onChange={(event) => {
+                            const value = Number(event.target.value)
+                            const next = {
+                              ...subscription,
+                              auto_update_interval_secs:
+                                Number.isFinite(value) && value > 0 ? value : null,
+                            }
+                            updateConfig((draft) => {
+                              const target = draft.subscriptions.find((item) => item.id === subscription.id)
+                              if (target) Object.assign(target, next)
+                            })
+                          }}
+                        />
+                      </Field>
+                      <Field label="转换目标核心">
+                        <select
+                          value={subscription.convert_core_target ?? ''}
+                          onChange={(event) => {
+                            const next = {
+                              ...subscription,
+                              convert_core_target: (event.target.value || null) as Subscription['convert_core_target'],
+                            }
+                            updateConfig((draft) => {
+                              const target = draft.subscriptions.find((item) => item.id === subscription.id)
+                              if (target) Object.assign(target, next)
+                            })
+                          }}
+                        >
+                          <option value="">跟随刷新按钮</option>
+                          <option value="sing_box">sing-box</option>
+                          <option value="xray">Xray</option>
+                          <option value="mihomo">mihomo</option>
+                        </select>
+                      </Field>
+                      <Field label="通过代理刷新">
+                        <select
+                          value={String(subscription.use_proxy_on_refresh)}
+                          onChange={(event) => {
+                            const next = {
+                              ...subscription,
+                              use_proxy_on_refresh: event.target.value === 'true',
+                            }
+                            updateConfig((draft) => {
+                              const target = draft.subscriptions.find((item) => item.id === subscription.id)
+                              if (target) Object.assign(target, next)
+                            })
+                          }}
+                        >
+                          <option value="true">true</option>
+                          <option value="false">false</option>
+                        </select>
+                      </Field>
+                    </div>
+                    <div className="mt-4 flex flex-wrap items-end gap-2">
                       <div className="flex items-end gap-2">
                         <ActionButton busy={busyAction === 'subscription-save'} onClick={() => void handleSaveSubscription(subscription)}>
                           保存
@@ -678,6 +945,9 @@ function App() {
                       </div>
                     </div>
                     <p className="mt-3 text-xs text-slate-400">最近同步：{subscription.last_synced_at ?? '未同步'}</p>
+                    {subscription.last_error ? (
+                      <p className="mt-1 text-xs text-rose-300">最近错误：{subscription.last_error}</p>
+                    ) : null}
                   </div>
                 ))}
               </div>
@@ -746,7 +1016,140 @@ function App() {
                   </Field>
                 </div>
               </SectionCard>
+
+              <SectionCard title="Mux">
+                <div className="grid gap-4 md:grid-cols-2">
+                  <Field label="全局启用">
+                    <select value={String(config.mux.enabled)} onChange={(event) => updateConfig((draft) => { draft.mux.enabled = event.target.value === 'true' })}>
+                      <option value="false">false</option>
+                      <option value="true">true</option>
+                    </select>
+                  </Field>
+                  <Field label="sing-box 协议">
+                    <select value={config.mux.sing_box_protocol} onChange={(event) => updateConfig((draft) => { draft.mux.sing_box_protocol = event.target.value })}>
+                      <option value="h2mux">h2mux</option>
+                      <option value="smux">smux</option>
+                      <option value="yamux">yamux</option>
+                      <option value="">禁用</option>
+                    </select>
+                  </Field>
+                  <Field label="sing-box 最大连接数">
+                    <input type="number" value={config.mux.sing_box_max_connections} onChange={(event) => updateConfig((draft) => { draft.mux.sing_box_max_connections = Number(event.target.value) || 0 })} />
+                  </Field>
+                  <Field label="sing-box padding">
+                    <select value={String(config.mux.sing_box_padding ?? '')} onChange={(event) => updateConfig((draft) => { draft.mux.sing_box_padding = event.target.value === '' ? null : event.target.value === 'true' })}>
+                      <option value="">default</option>
+                      <option value="true">true</option>
+                      <option value="false">false</option>
+                    </select>
+                  </Field>
+                  <Field label="Xray TCP 并发">
+                    <input type="number" value={config.mux.xray_concurrency ?? ''} onChange={(event) => updateConfig((draft) => { draft.mux.xray_concurrency = Number(event.target.value) || null })} />
+                  </Field>
+                  <Field label="Xray XUDP 并发">
+                    <input type="number" value={config.mux.xray_xudp_concurrency ?? ''} onChange={(event) => updateConfig((draft) => { draft.mux.xray_xudp_concurrency = Number(event.target.value) || null })} />
+                  </Field>
+                  <Field label="Xray UDP443 策略">
+                    <input value={config.mux.xray_xudp_proxy_udp_443 ?? ''} onChange={(event) => updateConfig((draft) => { draft.mux.xray_xudp_proxy_udp_443 = event.target.value })} />
+                  </Field>
+                </div>
+              </SectionCard>
+
+              <SectionCard title="Clash API">
+                <div className="grid gap-4 md:grid-cols-2">
+                  <Field label="external-controller 端口">
+                    <input type="number" value={config.clash.external_controller_port} onChange={(event) => updateConfig((draft) => { draft.clash.external_controller_port = Number(event.target.value) || 0 })} />
+                  </Field>
+                  <Field label="启用 IPv6">
+                    <select value={String(config.clash.enable_ipv6)} onChange={(event) => updateConfig((draft) => { draft.clash.enable_ipv6 = event.target.value === 'true' })}>
+                      <option value="false">false</option>
+                      <option value="true">true</option>
+                    </select>
+                  </Field>
+                  <Field label="代理组自动刷新">
+                    <select value={String(config.clash.proxies_auto_refresh)} onChange={(event) => updateConfig((draft) => { draft.clash.proxies_auto_refresh = event.target.value === 'true' })}>
+                      <option value="false">false</option>
+                      <option value="true">true</option>
+                    </select>
+                  </Field>
+                  <Field label="代理组测速间隔（秒）">
+                    <input type="number" value={config.clash.proxies_auto_delay_test_interval} onChange={(event) => updateConfig((draft) => { draft.clash.proxies_auto_delay_test_interval = Number(event.target.value) || 0 })} />
+                  </Field>
+                  <Field label="连接自动刷新">
+                    <select value={String(config.clash.connections_auto_refresh)} onChange={(event) => updateConfig((draft) => { draft.clash.connections_auto_refresh = event.target.value === 'true' })}>
+                      <option value="false">false</option>
+                      <option value="true">true</option>
+                    </select>
+                  </Field>
+                  <Field label="连接刷新间隔（秒）">
+                    <input type="number" value={config.clash.connections_refresh_interval} onChange={(event) => updateConfig((draft) => { draft.clash.connections_refresh_interval = Number(event.target.value) || 0 })} />
+                  </Field>
+                </div>
+              </SectionCard>
             </div>
+          ) : null}
+
+          {activeTab === 'clash' ? (
+            status.runtime.running && status.runtime.core_type === 'mihomo' ? (
+              <div className="grid gap-5 lg:grid-cols-[1fr_1fr]">
+                <SectionCard
+                  title="代理组"
+                  action={
+                    <ActionButton busy={busyAction === 'clash-refresh'} onClick={() => void refreshClashState()}>
+                      刷新
+                    </ActionButton>
+                  }
+                >
+                  <div className="space-y-4">
+                    {clashProxyGroups.length === 0 ? <div className="text-sm text-slate-400">暂无代理组数据</div> : null}
+                    {clashProxyGroups.map((group) => (
+                      <div key={group.name} className="rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
+                        <p className="font-medium">{group.name}</p>
+                        <p className="mt-1 text-xs text-slate-400">{group.proxy_type}</p>
+                        <div className="mt-3 flex gap-3">
+                          <select
+                            className="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm"
+                            value={group.now ?? ''}
+                            onChange={(event) => void handleClashProxySelect(group.name, event.target.value)}
+                          >
+                            {group.all.map((name) => (
+                              <option key={name} value={name}>
+                                {name}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </SectionCard>
+                <SectionCard
+                  title="连接"
+                  action={
+                    <ActionButton busy={busyAction === 'clash-refresh'} onClick={() => void refreshClashState()}>
+                      刷新
+                    </ActionButton>
+                  }
+                >
+                  <div className="space-y-3 text-sm text-slate-300">
+                    {clashConnections.length === 0 ? <div className="text-sm text-slate-400">暂无连接数据</div> : null}
+                    {clashConnections.map((connection) => (
+                      <div key={connection.id} className="rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
+                        <p className="font-mono text-xs text-slate-500">{connection.id}</p>
+                        <p className="mt-2">{connection.host ?? connection.destination ?? '-'}</p>
+                        <p className="mt-1 text-xs text-slate-400">
+                          {connection.rule ?? '-'} · {connection.chains.join(' -> ') || '-'}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                </SectionCard>
+              </div>
+            ) : (
+              <SectionCard title="Clash">
+                <div className="text-sm text-slate-400">仅在运行 `mihomo` 外部配置时显示代理组和连接信息。</div>
+              </SectionCard>
+            )
           ) : null}
 
           {activeTab === 'logs' ? (
@@ -826,7 +1229,7 @@ function CoreCard({
   return (
     <div className="rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
       <p className="text-lg font-medium text-slate-100">
-        {asset.core_type === 'sing_box' ? 'sing-box' : 'Xray'}
+        {asset.core_type === 'sing_box' ? 'sing-box' : asset.core_type === 'mihomo' ? 'mihomo' : 'Xray'}
       </p>
       <p className="mt-2 text-sm text-slate-400">已安装：{asset.installed_version ?? '未安装'}</p>
       <p className="mt-1 text-sm text-slate-400">最新：{asset.latest_version ?? '未知'}</p>

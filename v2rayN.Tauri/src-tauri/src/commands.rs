@@ -1,12 +1,18 @@
 use crate::{
     app_state::SharedState,
     domain,
-    models::{AppConfig, AppStatus, CoreAssetStatus, CoreType, ProxyProbe, RunningStatus, Subscription},
+    models::{
+        AppConfig, AppStatus, ClashConnection, ClashProxyGroup, CoreAssetStatus, CoreType,
+        ProxyProbe, RunningStatus, Subscription,
+    },
     network_probe,
     system_proxy,
 };
 use anyhow::{Context, Result};
 use reqwest::blocking::Client;
+use reqwest::Proxy;
+use serde_json::{json, Value};
+use std::path::PathBuf;
 use tauri::{AppHandle, State};
 
 fn load_status(app: &AppHandle, state: &SharedState) -> Result<AppStatus> {
@@ -24,6 +30,84 @@ fn load_status(app: &AppHandle, state: &SharedState) -> Result<AppStatus> {
         core_assets,
         proxy_probe,
     })
+}
+
+fn build_client(user_agent: &str, proxy_url: Option<&str>) -> Result<Client> {
+    let mut builder = Client::builder().user_agent(user_agent);
+    if let Some(proxy_url) = proxy_url {
+        builder = builder.proxy(Proxy::all(proxy_url)?);
+    }
+    builder.build().context("创建 HTTP 客户端失败")
+}
+
+fn download_text(url: &str, user_agent: &str, proxy_url: Option<&str>) -> Result<String> {
+    build_client(user_agent, proxy_url)?
+        .get(url)
+        .send()
+        .and_then(|response| response.error_for_status())
+        .and_then(|response| response.text())
+        .map_err(Into::into)
+}
+
+fn refresh_subscription_impl(
+    config: &mut AppConfig,
+    subscription_index: usize,
+    fallback_core_type: CoreType,
+    socks_port: u16,
+    import_storage_dir: &PathBuf,
+) -> Result<()> {
+    let subscription = config
+        .subscriptions
+        .get(subscription_index)
+        .cloned()
+        .context("未找到订阅")?;
+    let user_agent = subscription.user_agent.trim();
+    let user_agent = if user_agent.is_empty() { "v2rayN-tauri" } else { user_agent };
+    let proxy_url = format!("socks5h://127.0.0.1:{socks_port}");
+
+    let mut segments = vec![download_subscription_with_fallback(&subscription.url, user_agent, subscription.use_proxy_on_refresh, &proxy_url)?];
+    if subscription.convert_core_target.is_none() {
+        for more_url in subscription.more_urls.iter().map(String::as_str).map(str::trim).filter(|url| !url.is_empty()) {
+            segments.push(download_subscription_with_fallback(more_url, user_agent, subscription.use_proxy_on_refresh, &proxy_url)?);
+        }
+    }
+
+    let raw = segments.join("\n");
+    let core_type = subscription.convert_core_target.unwrap_or(fallback_core_type);
+    let import_format = domain::detect_import_format(&raw);
+    let profiles = match import_format {
+        domain::ImportFormat::ShareLinks => domain::import_share_links(&raw, core_type),
+        domain::ImportFormat::SingBoxJson
+        | domain::ImportFormat::XrayJson
+        | domain::ImportFormat::ClashYaml => domain::import_full_config(&raw, import_storage_dir),
+        domain::ImportFormat::Unknown => Err(anyhow::anyhow!("订阅内容无法识别")),
+    }?;
+    let mut profiles = if matches!(import_format, domain::ImportFormat::ShareLinks) {
+        domain::filter_profiles(profiles, subscription.filter.as_deref())?
+    } else {
+        profiles
+    };
+    for profile in &mut profiles {
+        profile.source_subscription_id = Some(subscription.id.clone());
+    }
+    domain::merge_profiles(config, profiles, Some(&subscription.id));
+    domain::apply_subscription_result(&mut config.subscriptions[subscription_index]);
+    Ok(())
+}
+
+fn download_subscription_with_fallback(
+    url: &str,
+    user_agent: &str,
+    use_proxy: bool,
+    proxy_url: &str,
+) -> Result<String> {
+    if use_proxy {
+        match download_text(url, user_agent, Some(proxy_url)) {
+            Ok(body) if !body.trim().is_empty() => return Ok(body),
+            Ok(_) | Err(_) => {}
+        }
+    }
+    download_text(url, user_agent, None)
 }
 
 #[tauri::command]
@@ -45,9 +129,35 @@ pub fn import_share_links(
 ) -> Result<AppConfig, String> {
     let mut config = state.store.load().map_err(error_to_string)?;
     let profiles = domain::import_share_links(&raw, core_type).map_err(error_to_string)?;
+    let selected_id = profiles.last().map(|profile| profile.id.clone());
     let imported = domain::merge_imported_profiles(&mut config, profiles);
     if imported == 0 {
         return Err("未导入任何可识别的分享链接".into());
+    }
+    if let Some(selected_id) = selected_id {
+        config.selected_profile_id = Some(selected_id);
+    }
+    state.store.save(&config).map_err(error_to_string)?;
+    Ok(config)
+}
+
+#[tauri::command]
+pub fn preview_import_result(raw: String, core_type: CoreType) -> Result<domain::ImportPreview, String> {
+    domain::preview_import(&raw, core_type).map_err(error_to_string)
+}
+
+#[tauri::command]
+pub fn import_full_config(raw: String, state: State<'_, SharedState>) -> Result<AppConfig, String> {
+    let mut config = state.store.load().map_err(error_to_string)?;
+    let import_dir = PathBuf::from(state.store.paths().bin_configs).join("imported");
+    let profiles = domain::import_full_config(&raw, &import_dir).map_err(error_to_string)?;
+    let selected_id = profiles.last().map(|profile| profile.id.clone());
+    let imported = domain::merge_profiles(&mut config, profiles, None);
+    if imported == 0 {
+        return Err("未导入任何完整配置".into());
+    }
+    if let Some(selected_id) = selected_id {
+        config.selected_profile_id = Some(selected_id);
     }
     state.store.save(&config).map_err(error_to_string)?;
     Ok(config)
@@ -90,20 +200,19 @@ pub fn refresh_subscription(
         .position(|item| item.id == subscription_id)
         .context("未找到订阅")
         .map_err(error_to_string)?;
+    let socks_port = config.proxy.socks_port;
 
-    let subscription_url = config.subscriptions[subscription_index].url.clone();
-
-    let raw = Client::builder()
-        .user_agent("v2rayN-tauri")
-        .build()
-        .and_then(|client| client.get(&subscription_url).send())
-        .and_then(|response| response.error_for_status())
-        .and_then(|response| response.text())
-        .map_err(|error| error.to_string())?;
-
-    let profiles = domain::import_share_links(&raw, core_type).map_err(error_to_string)?;
-    domain::merge_imported_profiles(&mut config, profiles);
-    domain::apply_subscription_result(&mut config.subscriptions[subscription_index]);
+    let import_dir = PathBuf::from(state.store.paths().bin_configs).join("imported");
+    if let Err(error) = refresh_subscription_impl(
+        &mut config,
+        subscription_index,
+        core_type,
+        socks_port,
+        &import_dir,
+    ) {
+        domain::apply_subscription_error(&mut config.subscriptions[subscription_index], error.to_string());
+        return Err(error_to_string(error));
+    }
     state.store.save(&config).map_err(error_to_string)?;
     Ok(config)
 }
@@ -111,27 +220,17 @@ pub fn refresh_subscription(
 #[tauri::command]
 pub fn refresh_all_subscriptions(core_type: CoreType, state: State<'_, SharedState>) -> Result<AppConfig, String> {
     let mut config = state.store.load().map_err(error_to_string)?;
-    let client = Client::builder()
-        .user_agent("v2rayN-tauri")
-        .build()
-        .map_err(|error| error.to_string())?;
+    let import_dir = PathBuf::from(state.store.paths().bin_configs).join("imported");
+    let socks_port = config.proxy.socks_port;
 
     for index in 0..config.subscriptions.len() {
         let subscription = &config.subscriptions[index];
         if !subscription.enabled || subscription.url.trim().is_empty() {
             continue;
         }
-
-        let raw = client
-            .get(&subscription.url)
-            .send()
-            .and_then(|response| response.error_for_status())
-            .and_then(|response| response.text())
-            .map_err(|error| error.to_string())?;
-
-        let profiles = domain::import_share_links(&raw, core_type.clone()).map_err(error_to_string)?;
-        domain::merge_imported_profiles(&mut config, profiles);
-        domain::apply_subscription_result(&mut config.subscriptions[index]);
+        if let Err(error) = refresh_subscription_impl(&mut config, index, core_type.clone(), socks_port, &import_dir) {
+            domain::apply_subscription_error(&mut config.subscriptions[index], error.to_string());
+        }
     }
 
     state.store.save(&config).map_err(error_to_string)?;
@@ -170,8 +269,7 @@ pub fn select_profile(profile_id: String, state: State<'_, SharedState>) -> Resu
 #[tauri::command]
 pub fn generate_config_preview(state: State<'_, SharedState>) -> Result<String, String> {
     let config = state.store.load().map_err(error_to_string)?;
-    let preview = domain::generate_preview(&config).map_err(error_to_string)?;
-    serde_json::to_string_pretty(&preview).map_err(|error| error.to_string())
+    domain::generate_preview(&config).map_err(error_to_string)
 }
 
 #[tauri::command]
@@ -279,6 +377,109 @@ pub fn probe_current_outbound(state: State<'_, SharedState>) -> Result<ProxyProb
     } else {
         network_probe::probe_direct().map_err(error_to_string)
     }
+}
+
+#[tauri::command]
+pub fn get_clash_proxy_groups(state: State<'_, SharedState>) -> Result<Vec<ClashProxyGroup>, String> {
+    let config = state.store.load().map_err(error_to_string)?;
+    let value = clash_api_get(&config, "/proxies").map_err(error_to_string)?;
+    let mut groups = vec![];
+    if let Some(proxies) = value.get("proxies").and_then(Value::as_object) {
+        for (name, proxy) in proxies {
+            let all = proxy
+                .get("all")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if all.is_empty() {
+                continue;
+            }
+            groups.push(ClashProxyGroup {
+                name: name.clone(),
+                proxy_type: proxy
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Unknown")
+                    .to_string(),
+                now: proxy.get("now").and_then(Value::as_str).map(str::to_string),
+                all,
+            });
+        }
+    }
+    Ok(groups)
+}
+
+#[tauri::command]
+pub fn select_clash_proxy(group_name: String, proxy_name: String, state: State<'_, SharedState>) -> Result<(), String> {
+    let config = state.store.load().map_err(error_to_string)?;
+    clash_api_put(
+        &config,
+        &format!("/proxies/{}", urlencoding::encode(&group_name)),
+        json!({ "name": proxy_name }),
+    )
+    .map_err(error_to_string)
+}
+
+#[tauri::command]
+pub fn get_clash_connections(state: State<'_, SharedState>) -> Result<Vec<ClashConnection>, String> {
+    let config = state.store.load().map_err(error_to_string)?;
+    let value = clash_api_get(&config, "/connections").map_err(error_to_string)?;
+    let mut connections = vec![];
+    for item in value
+        .get("connections")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let metadata = item.get("metadata").and_then(Value::as_object);
+        let destination = match (
+            metadata.and_then(|meta| meta.get("destinationIP")).and_then(Value::as_str),
+            metadata.and_then(|meta| meta.get("destinationPort")).and_then(Value::as_u64),
+        ) {
+            (Some(host), Some(port)) => Some(format!("{host}:{port}")),
+            _ => None,
+        };
+        connections.push(ClashConnection {
+            id: item
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            network: item.get("metadata").and_then(|meta| meta.get("network")).and_then(Value::as_str).map(str::to_string),
+            r#type: metadata.and_then(|meta| meta.get("type")).and_then(Value::as_str).map(str::to_string),
+            rule: item.get("rule").and_then(Value::as_str).map(str::to_string),
+            chains: item
+                .get("chains")
+                .and_then(Value::as_array)
+                .map(|items| items.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                .unwrap_or_default(),
+            upload: item.get("upload").and_then(Value::as_u64),
+            download: item.get("download").and_then(Value::as_u64),
+            host: metadata.and_then(|meta| meta.get("host")).and_then(Value::as_str).map(str::to_string),
+            destination,
+            start: item.get("start").and_then(Value::as_str).map(str::to_string),
+        });
+    }
+    Ok(connections)
+}
+
+fn clash_api_get(config: &AppConfig, path: &str) -> Result<Value> {
+    let client = build_client("v2rayN-tauri", None)?;
+    let url = format!("http://127.0.0.1:{}{}", config.clash.external_controller_port, path);
+    let response = client.get(url).send()?.error_for_status()?;
+    Ok(response.json()?)
+}
+
+fn clash_api_put(config: &AppConfig, path: &str, body: Value) -> Result<()> {
+    let client = build_client("v2rayN-tauri", None)?;
+    let url = format!("http://127.0.0.1:{}{}", config.clash.external_controller_port, path);
+    client.put(url).json(&body).send()?.error_for_status()?;
+    Ok(())
 }
 
 fn error_to_string(error: impl std::fmt::Display) -> String {

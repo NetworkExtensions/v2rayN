@@ -39,7 +39,7 @@ struct GithubAsset {
 
 pub fn list_core_statuses(app: &AppHandle, core_paths: &CorePaths) -> Result<Vec<CoreAssetStatus>> {
     let _ = app;
-    [CoreType::Xray, CoreType::SingBox]
+    [CoreType::Xray, CoreType::SingBox, CoreType::Mihomo]
         .iter()
         .map(|core_type| core_status(core_paths, core_type.clone()))
         .collect()
@@ -85,6 +85,7 @@ fn fetch_release(core_type: &CoreType) -> Result<GithubRelease> {
     let repo = match core_type {
         CoreType::Xray => "XTLS/Xray-core",
         CoreType::SingBox => "SagerNet/sing-box",
+        CoreType::Mihomo => "MetaCubeX/mihomo",
     };
     let url = format!("https://api.github.com/repos/{repo}/releases/latest");
     let response = client.get(url).send()?.error_for_status()?;
@@ -99,19 +100,12 @@ fn github_client() -> Result<Client> {
 }
 
 fn select_asset(core_type: &CoreType, assets: &[GithubAsset]) -> Result<GithubAsset> {
-    let expected_name = match core_type {
-        CoreType::Xray => "Xray-macos-arm64-v8a.zip",
-        CoreType::SingBox => "-darwin-arm64.tar.gz",
-    };
-
     assets
         .iter()
-        .find(|asset| {
-            if matches!(core_type, CoreType::Xray) {
-                asset.name == expected_name
-            } else {
-                asset.name.contains(expected_name)
-            }
+        .find(|asset| match core_type {
+            CoreType::Xray => asset.name == "Xray-macos-arm64-v8a.zip",
+            CoreType::SingBox => asset.name.contains("-darwin-arm64.tar.gz"),
+            CoreType::Mihomo => asset.name.contains("mihomo-darwin-arm64") && asset.name.ends_with(".gz"),
         })
         .cloned()
         .context("未找到当前平台可用的核心安装包")
@@ -149,6 +143,21 @@ fn install_asset(url: &str, target_dir: &Path, core_type: &CoreType) -> Result<(
         return Ok(());
     }
 
+    if url.ends_with(".gz") {
+        let reader = Cursor::new(bytes);
+        let mut gz = GzDecoder::new(reader);
+        let asset_name = url
+            .rsplit('/')
+            .next()
+            .context("无法解析安装包文件名")?;
+        let output_name = asset_name.strip_suffix(".gz").unwrap_or(asset_name);
+        let output_path = target_dir.join(output_name);
+        let mut output = File::create(&output_path)?;
+        io::copy(&mut gz, &mut output)?;
+        set_executable(&output_path)?;
+        return Ok(());
+    }
+
     Err(anyhow!("暂不支持该安装包格式"))
 }
 
@@ -180,18 +189,38 @@ fn resolve_executable_path(directory: &Path, core_type: &CoreType) -> Option<Pat
     let names = match core_type {
         CoreType::Xray => vec!["xray"],
         CoreType::SingBox => vec!["sing-box", "sing-box-client"],
+        CoreType::Mihomo => vec!["mihomo", "clash", "mihomo-darwin-arm64", "mihomo-darwin-amd64-v1"],
     };
 
-    names
+    let exact = names
         .into_iter()
         .map(|name| directory.join(name))
-        .find(|path| path.exists())
+        .find(|path| path.exists());
+    if exact.is_some() {
+        return exact;
+    }
+
+    if matches!(core_type, CoreType::Mihomo) {
+        return fs::read_dir(directory)
+            .ok()?
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .map(|name| name == "mihomo" || name == "clash" || name.starts_with("mihomo-"))
+                    .unwrap_or(false)
+            });
+    }
+
+    None
 }
 
 fn get_installed_version(path: &Path, core_type: &CoreType) -> Result<String> {
     let output = match core_type {
         CoreType::Xray => Command::new(path).arg("-version").output()?,
         CoreType::SingBox => Command::new(path).arg("version").output()?,
+        CoreType::Mihomo => Command::new(path).arg("-v").output()?,
     };
     let stdout = String::from_utf8_lossy(&output.stdout);
     let version = stdout

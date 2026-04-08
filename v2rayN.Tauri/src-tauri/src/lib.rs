@@ -41,6 +41,8 @@ pub fn run() {
             commands::get_app_status,
             commands::save_app_config,
             commands::import_share_links,
+            commands::preview_import_result,
+            commands::import_full_config,
             commands::save_subscription,
             commands::remove_subscription,
             commands::refresh_subscription,
@@ -56,6 +58,9 @@ pub fn run() {
             commands::enable_system_proxy,
             commands::disable_system_proxy,
             commands::probe_current_outbound,
+            commands::get_clash_proxy_groups,
+            commands::select_clash_proxy,
+            commands::get_clash_connections,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

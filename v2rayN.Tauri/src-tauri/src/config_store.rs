@@ -129,4 +129,16 @@ fn normalize_config(config: &mut AppConfig) {
     if config.selected_profile_id.is_none() {
         config.selected_profile_id = config.profiles.first().map(|profile| profile.id.clone());
     }
+
+    if config.mux.sing_box_protocol.is_empty() {
+        config.mux.sing_box_protocol = "h2mux".into();
+    }
+
+    if config.mux.sing_box_max_connections == 0 {
+        config.mux.sing_box_max_connections = 8;
+    }
+
+    if config.clash.external_controller_port == 0 {
+        config.clash.external_controller_port = config.proxy.socks_port.saturating_add(5);
+    }
 }

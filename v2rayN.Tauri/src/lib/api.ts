@@ -4,9 +4,12 @@ import { listen } from '@tauri-apps/api/event'
 import type {
   AppConfig,
   AppStatus,
+  ClashConnection,
+  ClashProxyGroup,
   CoreAssetStatus,
   CoreLogEvent,
   CoreType,
+  ImportPreview,
   ProxyProbe,
   RunningStatus,
   Subscription,
@@ -17,6 +20,9 @@ export const desktopApi = {
   saveConfig: (config: AppConfig) => invoke<AppConfig>('save_app_config', { config }),
   importShareLinks: (raw: string, coreType: CoreType) =>
     invoke<AppConfig>('import_share_links', { raw, coreType }),
+  previewImport: (raw: string, coreType: CoreType) =>
+    invoke<ImportPreview>('preview_import_result', { raw, coreType }),
+  importFullConfig: (raw: string) => invoke<AppConfig>('import_full_config', { raw }),
   saveSubscription: (subscription: Subscription) =>
     invoke<AppConfig>('save_subscription', { subscription }),
   removeSubscription: (subscriptionId: string) =>
@@ -37,6 +43,10 @@ export const desktopApi = {
   enableSystemProxy: () => invoke<AppConfig>('enable_system_proxy'),
   disableSystemProxy: () => invoke<AppConfig>('disable_system_proxy'),
   probeCurrentOutbound: () => invoke<ProxyProbe>('probe_current_outbound'),
+  getClashProxyGroups: () => invoke<ClashProxyGroup[]>('get_clash_proxy_groups'),
+  selectClashProxy: (groupName: string, proxyName: string) =>
+    invoke<void>('select_clash_proxy', { groupName, proxyName }),
+  getClashConnections: () => invoke<ClashConnection[]>('get_clash_connections'),
   onCoreLog: (handler: (event: CoreLogEvent) => void) =>
     listen<CoreLogEvent>('core-log', ({ payload }) => handler(payload)),
 }

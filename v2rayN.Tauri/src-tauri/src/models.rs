@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 pub enum CoreType {
     Xray,
     SingBox,
+    Mihomo,
 }
 
 impl Default for CoreType {
@@ -18,6 +19,7 @@ impl CoreType {
         match self {
             Self::Xray => "xray",
             Self::SingBox => "sing_box",
+            Self::Mihomo => "mihomo",
         }
     }
 }
@@ -42,7 +44,33 @@ impl Default for ProfileProtocol {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileConfigType {
+    #[default]
+    Native,
+    External,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalConfigFormat {
+    SingBox,
+    Xray,
+    Clash,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MuxOverride {
+    #[default]
+    FollowGlobal,
+    ForceEnable,
+    ForceDisable,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Profile {
     pub id: String,
     pub name: String,
@@ -66,6 +94,11 @@ pub struct Profile {
     pub reality_short_id: Option<String>,
     pub alpn: Vec<String>,
     pub udp: bool,
+    pub mux_override: MuxOverride,
+    pub source_subscription_id: Option<String>,
+    pub config_type: ProfileConfigType,
+    pub external_config_format: Option<ExternalConfigFormat>,
+    pub external_config_path: Option<String>,
 }
 
 impl Default for Profile {
@@ -93,17 +126,30 @@ impl Default for Profile {
             reality_short_id: None,
             alpn: vec![],
             udp: true,
+            mux_override: MuxOverride::FollowGlobal,
+            source_subscription_id: None,
+            config_type: ProfileConfigType::Native,
+            external_config_format: None,
+            external_config_path: None,
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Subscription {
     pub id: String,
     pub name: String,
     pub url: String,
     pub enabled: bool,
+    pub more_urls: Vec<String>,
+    pub user_agent: String,
+    pub filter: Option<String>,
+    pub auto_update_interval_secs: Option<u64>,
+    pub convert_core_target: Option<CoreType>,
+    pub use_proxy_on_refresh: bool,
     pub last_synced_at: Option<String>,
+    pub last_error: Option<String>,
 }
 
 impl Default for Subscription {
@@ -113,12 +159,20 @@ impl Default for Subscription {
             name: "新订阅".into(),
             url: String::new(),
             enabled: true,
+            more_urls: vec![],
+            user_agent: "v2rayN-tauri".into(),
+            filter: None,
+            auto_update_interval_secs: None,
+            convert_core_target: None,
+            use_proxy_on_refresh: true,
             last_synced_at: None,
+            last_error: None,
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ProxySettings {
     pub http_port: u16,
     pub socks_port: u16,
@@ -140,6 +194,7 @@ impl Default for ProxySettings {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TunSettings {
     pub enabled: bool,
     pub interface_name: String,
@@ -163,6 +218,7 @@ impl Default for TunSettings {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DnsSettings {
     pub remote_dns: String,
     pub direct_dns: String,
@@ -178,6 +234,7 @@ impl Default for DnsSettings {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RoutingSettings {
     pub mode: String,
 }
@@ -191,6 +248,57 @@ impl Default for RoutingSettings {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MuxSettings {
+    pub enabled: bool,
+    pub xray_concurrency: Option<i32>,
+    pub xray_xudp_concurrency: Option<i32>,
+    pub xray_xudp_proxy_udp_443: Option<String>,
+    pub sing_box_protocol: String,
+    pub sing_box_max_connections: u16,
+    pub sing_box_padding: Option<bool>,
+}
+
+impl Default for MuxSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            xray_concurrency: Some(8),
+            xray_xudp_concurrency: Some(16),
+            xray_xudp_proxy_udp_443: Some("reject".into()),
+            sing_box_protocol: "h2mux".into(),
+            sing_box_max_connections: 8,
+            sing_box_padding: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ClashSettings {
+    pub external_controller_port: u16,
+    pub enable_ipv6: bool,
+    pub proxies_auto_refresh: bool,
+    pub proxies_auto_delay_test_interval: u16,
+    pub connections_auto_refresh: bool,
+    pub connections_refresh_interval: u16,
+}
+
+impl Default for ClashSettings {
+    fn default() -> Self {
+        Self {
+            external_controller_port: 10813,
+            enable_ipv6: false,
+            proxies_auto_refresh: false,
+            proxies_auto_delay_test_interval: 10,
+            connections_auto_refresh: false,
+            connections_refresh_interval: 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AppConfig {
     pub selected_profile_id: Option<String>,
     pub profiles: Vec<Profile>,
@@ -199,6 +307,8 @@ pub struct AppConfig {
     pub tun: TunSettings,
     pub dns: DnsSettings,
     pub routing: RoutingSettings,
+    pub mux: MuxSettings,
+    pub clash: ClashSettings,
 }
 
 impl Default for AppConfig {
@@ -212,6 +322,8 @@ impl Default for AppConfig {
             tun: TunSettings::default(),
             dns: DnsSettings::default(),
             routing: RoutingSettings::default(),
+            mux: MuxSettings::default(),
+            clash: ClashSettings::default(),
         }
     }
 }
@@ -270,6 +382,28 @@ pub struct ProxyProbe {
     pub country: Option<String>,
     pub city: Option<String>,
     pub isp: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClashProxyGroup {
+    pub name: String,
+    pub proxy_type: String,
+    pub now: Option<String>,
+    pub all: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClashConnection {
+    pub id: String,
+    pub network: Option<String>,
+    pub r#type: Option<String>,
+    pub rule: Option<String>,
+    pub chains: Vec<String>,
+    pub upload: Option<u64>,
+    pub download: Option<u64>,
+    pub host: Option<String>,
+    pub destination: Option<String>,
+    pub start: Option<String>,
 }
 
 pub fn new_id(prefix: &str) -> String {

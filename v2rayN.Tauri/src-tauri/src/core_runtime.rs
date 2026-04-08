@@ -74,8 +74,8 @@ impl RuntimeManager {
         let bundle = generate_runtime_bundle(&config)?;
         let executable = resolve_executable(core_paths, &bundle.main_core_type)
             .context("未找到已安装的核心，请先下载核心")?;
-        let config_path = PathBuf::from(store.paths().bin_configs.clone()).join(&bundle.main_file_name);
-        fs::write(&config_path, serde_json::to_vec_pretty(&bundle.main_config)?)?;
+        let config_path = PathBuf::from(store.paths().bin_configs.clone()).join(&bundle.main_artifact.file_name);
+        fs::write(&config_path, bundle.main_artifact.content.as_bytes())?;
 
         let mut children = Vec::new();
         let mut elevated_pids = Vec::new();
@@ -115,8 +115,8 @@ impl RuntimeManager {
         if let Some(helper) = bundle.helper {
             let helper_executable = resolve_executable(core_paths, &helper.core_type)
                 .context("未找到 TUN 辅助核心，请先下载对应核心")?;
-            let helper_path = PathBuf::from(store.paths().bin_configs.clone()).join(&helper.file_name);
-            fs::write(&helper_path, serde_json::to_vec_pretty(&helper.config)?)?;
+            let helper_path = PathBuf::from(store.paths().bin_configs.clone()).join(&helper.artifact.file_name);
+            fs::write(&helper_path, helper.artifact.content.as_bytes())?;
 
             let pid = start_elevated_core(
                 app,
@@ -165,7 +165,7 @@ impl RuntimeManager {
 fn runtime_envs(core_type: &CoreType, store: &ConfigStore) -> Vec<(String, String)> {
     match core_type {
         CoreType::Xray => vec![("XRAY_LOCATION_ASSET".into(), store.paths().bin)],
-        CoreType::SingBox => vec![],
+        CoreType::SingBox | CoreType::Mihomo => vec![],
     }
 }
 
@@ -231,6 +231,7 @@ fn core_args(core_type: &CoreType, config_path: &Path) -> Vec<String> {
             config_path.to_string_lossy().to_string(),
             "--disable-color".into(),
         ],
+        CoreType::Mihomo => vec!["-f".into(), config_path.to_string_lossy().to_string()],
     }
 }
 

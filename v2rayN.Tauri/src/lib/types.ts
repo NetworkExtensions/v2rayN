@@ -1,4 +1,4 @@
-export type CoreType = 'xray' | 'sing_box'
+export type CoreType = 'xray' | 'sing_box' | 'mihomo'
 export type ProfileProtocol =
   | 'vless'
   | 'vmess'
@@ -9,6 +9,10 @@ export type ProfileProtocol =
   | 'wire_guard'
   | 'naive'
   | 'anytls'
+
+export type ProfileConfigType = 'native' | 'external'
+export type ExternalConfigFormat = 'sing_box' | 'xray' | 'clash'
+export type MuxOverride = 'follow_global' | 'force_enable' | 'force_disable'
 
 export interface Profile {
   id: string
@@ -33,6 +37,11 @@ export interface Profile {
   reality_short_id?: string | null
   alpn: string[]
   udp: boolean
+  mux_override: MuxOverride
+  source_subscription_id?: string | null
+  config_type: ProfileConfigType
+  external_config_format?: ExternalConfigFormat | null
+  external_config_path?: string | null
 }
 
 export interface Subscription {
@@ -40,7 +49,14 @@ export interface Subscription {
   name: string
   url: string
   enabled: boolean
+  more_urls: string[]
+  user_agent: string
+  filter?: string | null
+  auto_update_interval_secs?: number | null
+  convert_core_target?: CoreType | null
+  use_proxy_on_refresh: boolean
   last_synced_at?: string | null
+  last_error?: string | null
 }
 
 export interface ProxySettings {
@@ -69,6 +85,25 @@ export interface RoutingSettings {
   mode: string
 }
 
+export interface MuxSettings {
+  enabled: boolean
+  xray_concurrency?: number | null
+  xray_xudp_concurrency?: number | null
+  xray_xudp_proxy_udp_443?: string | null
+  sing_box_protocol: string
+  sing_box_max_connections: number
+  sing_box_padding?: boolean | null
+}
+
+export interface ClashSettings {
+  external_controller_port: number
+  enable_ipv6: boolean
+  proxies_auto_refresh: boolean
+  proxies_auto_delay_test_interval: number
+  connections_auto_refresh: boolean
+  connections_refresh_interval: number
+}
+
 export interface AppConfig {
   selected_profile_id?: string | null
   profiles: Profile[]
@@ -77,6 +112,8 @@ export interface AppConfig {
   tun: TunSettings
   dns: DnsSettings
   routing: RoutingSettings
+  mux: MuxSettings
+  clash: ClashSettings
 }
 
 export interface AppPaths {
@@ -127,4 +164,35 @@ export interface ProxyProbe {
   country?: string | null
   city?: string | null
   isp?: string | null
+}
+
+export type ImportFormat = 'share_links' | 'sing_box_json' | 'xray_json' | 'clash_yaml' | 'unknown'
+
+export interface ImportPreview {
+  format: ImportFormat
+  profile_names: string[]
+  profile_count: number
+  stores_as_external: boolean
+  external_format?: ExternalConfigFormat | null
+  message?: string | null
+}
+
+export interface ClashProxyGroup {
+  name: string
+  proxy_type: string
+  now?: string | null
+  all: string[]
+}
+
+export interface ClashConnection {
+  id: string
+  network?: string | null
+  type?: string | null
+  rule?: string | null
+  chains: string[]
+  upload?: number | null
+  download?: number | null
+  host?: string | null
+  destination?: string | null
+  start?: string | null
 }

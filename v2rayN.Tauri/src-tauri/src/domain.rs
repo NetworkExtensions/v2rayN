@@ -1,27 +1,55 @@
 use crate::models::{
-    AppConfig, CoreType, DnsSettings, Profile, ProfileProtocol, ProxySettings, RoutingSettings,
-    Subscription, TunSettings,
+    AppConfig, CoreType, DnsSettings, ExternalConfigFormat, MuxOverride, Profile,
+    ProfileConfigType, ProfileProtocol, ProxySettings, RoutingSettings, Subscription, TunSettings,
 };
 use anyhow::{anyhow, Context, Result};
 use base64::Engine;
+use regex::Regex;
+use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::HashSet;
+use std::fs;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use url::Url;
 
 #[derive(Debug, Clone)]
+pub struct ConfigArtifact {
+    pub file_name: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct HelperConfig {
     pub core_type: CoreType,
-    pub file_name: String,
-    pub config: Value,
+    pub artifact: ConfigArtifact,
 }
 
 #[derive(Debug, Clone)]
 pub struct RuntimeBundle {
     pub main_core_type: CoreType,
-    pub main_file_name: String,
-    pub main_config: Value,
+    pub main_artifact: ConfigArtifact,
     pub helper: Option<HelperConfig>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportFormat {
+    ShareLinks,
+    SingBoxJson,
+    XrayJson,
+    ClashYaml,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ImportPreview {
+    pub format: ImportFormat,
+    pub profile_names: Vec<String>,
+    pub profile_count: usize,
+    pub stores_as_external: bool,
+    pub external_format: Option<ExternalConfigFormat>,
+    pub message: Option<String>,
 }
 
 pub fn ensure_profile(config: &AppConfig) -> Result<&Profile> {
@@ -70,6 +98,7 @@ pub fn import_share_links(raw: &str, core_type: CoreType) -> Result<Vec<Profile>
 
         if seen.insert(format!("{}:{}:{}", profile.server, profile.port, profile.name)) {
             profile.core_type = core_type.clone();
+            profile.config_type = ProfileConfigType::Native;
             profiles.push(profile);
         }
     }
@@ -78,12 +107,32 @@ pub fn import_share_links(raw: &str, core_type: CoreType) -> Result<Vec<Profile>
 }
 
 pub fn merge_imported_profiles(config: &mut AppConfig, imported: Vec<Profile>) -> usize {
+    merge_profiles(config, imported, None)
+}
+
+pub fn merge_profiles(
+    config: &mut AppConfig,
+    imported: Vec<Profile>,
+    source_subscription_id: Option<&str>,
+) -> usize {
     let before = config.profiles.len();
+    if let Some(source_id) = source_subscription_id {
+        config
+            .profiles
+            .retain(|profile| profile.source_subscription_id.as_deref() != Some(source_id));
+    }
+
     for profile in imported {
         if config
             .profiles
             .iter()
-            .any(|existing| existing.server == profile.server && existing.port == profile.port && existing.name == profile.name)
+            .any(|existing| {
+                existing.server == profile.server
+                    && existing.port == profile.port
+                    && existing.name == profile.name
+                    && existing.config_type == profile.config_type
+                    && existing.external_config_path == profile.external_config_path
+            })
         {
             continue;
         }
@@ -104,16 +153,222 @@ pub fn apply_subscription_result(subscription: &mut Subscription) {
             .map(|duration| duration.as_secs().to_string())
             .unwrap_or_else(|_| "0".into()),
     );
+    subscription.last_error = None;
+}
+
+pub fn apply_subscription_error(subscription: &mut Subscription, message: impl Into<String>) {
+    subscription.last_error = Some(message.into());
+}
+
+pub fn filter_profiles(imported: Vec<Profile>, filter: Option<&str>) -> Result<Vec<Profile>> {
+    let Some(filter) = filter.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(imported);
+    };
+
+    let regex = Regex::new(filter).with_context(|| format!("订阅过滤器无效: {filter}"))?;
+    Ok(imported
+        .into_iter()
+        .filter(|profile| regex.is_match(&profile.name))
+        .collect())
+}
+
+pub fn detect_import_format(raw: &str) -> ImportFormat {
+    let lines = expand_subscription_body(raw);
+    if lines.iter().any(|line| looks_like_share_link(line)) {
+        return ImportFormat::ShareLinks;
+    }
+
+    if let Ok(value) = serde_json::from_str::<Value>(raw) {
+        if value.get("inbounds").is_some() && value.get("outbounds").is_some() && value.get("route").is_some() {
+            return ImportFormat::SingBoxJson;
+        }
+        if value.get("inbounds").is_some() && value.get("outbounds").is_some() && value.get("routing").is_some() {
+            return ImportFormat::XrayJson;
+        }
+    }
+
+    if let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(raw) {
+        if let Some(mapping) = value.as_mapping() {
+            if mapping.contains_key(serde_yaml::Value::from("proxies"))
+                || mapping.contains_key(serde_yaml::Value::from("proxy-groups"))
+                || mapping.contains_key(serde_yaml::Value::from("proxy-providers"))
+            {
+                return ImportFormat::ClashYaml;
+            }
+        }
+    }
+
+    ImportFormat::Unknown
+}
+
+pub fn preview_import(raw: &str, core_type: CoreType) -> Result<ImportPreview> {
+    match detect_import_format(raw) {
+        ImportFormat::ShareLinks => {
+            let profiles = import_share_links(raw, core_type)?;
+            Ok(ImportPreview {
+                format: ImportFormat::ShareLinks,
+                profile_names: profiles.iter().map(|profile| profile.name.clone()).collect(),
+                profile_count: profiles.len(),
+                stores_as_external: false,
+                external_format: None,
+                message: Some("将作为普通分享链接导入".into()),
+            })
+        }
+        ImportFormat::SingBoxJson => {
+            let names = extract_json_outbound_names(raw, "tag")?;
+            Ok(ImportPreview {
+                format: ImportFormat::SingBoxJson,
+                profile_names: names,
+                profile_count: 1,
+                stores_as_external: true,
+                external_format: Some(ExternalConfigFormat::SingBox),
+                message: Some("将作为外部 sing-box 配置导入".into()),
+            })
+        }
+        ImportFormat::XrayJson => {
+            let names = extract_json_outbound_names(raw, "tag")?;
+            Ok(ImportPreview {
+                format: ImportFormat::XrayJson,
+                profile_names: names,
+                profile_count: 1,
+                stores_as_external: true,
+                external_format: Some(ExternalConfigFormat::Xray),
+                message: Some("将作为外部 Xray 配置导入".into()),
+            })
+        }
+        ImportFormat::ClashYaml => {
+            let names = extract_clash_proxy_names(raw)?;
+            Ok(ImportPreview {
+                format: ImportFormat::ClashYaml,
+                profile_names: names,
+                profile_count: 1,
+                stores_as_external: true,
+                external_format: Some(ExternalConfigFormat::Clash),
+                message: Some("将作为外部 Clash YAML 导入，并使用 mihomo 运行".into()),
+            })
+        }
+        ImportFormat::Unknown => Ok(ImportPreview {
+            format: ImportFormat::Unknown,
+            profile_names: vec![],
+            profile_count: 0,
+            stores_as_external: false,
+            external_format: None,
+            message: Some("未识别到支持的分享链接、JSON 或 YAML 配置".into()),
+        }),
+    }
+}
+
+pub fn import_full_config(raw: &str, storage_dir: &Path) -> Result<Vec<Profile>> {
+    fs::create_dir_all(storage_dir)
+        .with_context(|| format!("创建导入配置目录失败: {}", storage_dir.display()))?;
+
+    match detect_import_format(raw) {
+        ImportFormat::SingBoxJson => {
+            let path = persist_external_config(raw, storage_dir, "singbox", "json")?;
+            Ok(vec![build_external_profile(
+                "sing-box 外部配置",
+                CoreType::SingBox,
+                ExternalConfigFormat::SingBox,
+                &path,
+            )])
+        }
+        ImportFormat::XrayJson => {
+            let path = persist_external_config(raw, storage_dir, "xray", "json")?;
+            Ok(vec![build_external_profile(
+                "Xray 外部配置",
+                CoreType::Xray,
+                ExternalConfigFormat::Xray,
+                &path,
+            )])
+        }
+        ImportFormat::ClashYaml => {
+            let path = persist_external_config(raw, storage_dir, "clash", "yaml")?;
+            Ok(vec![build_external_profile(
+                "Clash 外部配置",
+                CoreType::Mihomo,
+                ExternalConfigFormat::Clash,
+                &path,
+            )])
+        }
+        ImportFormat::ShareLinks => Err(anyhow!("该内容属于分享链接，请使用分享链接导入接口")),
+        ImportFormat::Unknown => Err(anyhow!("未识别的完整配置格式")),
+    }
+}
+
+fn persist_external_config(raw: &str, storage_dir: &Path, prefix: &str, ext: &str) -> Result<String> {
+    let file_name = format!("{prefix}-{}.{}", new_timestamp_suffix(), ext);
+    let path = storage_dir.join(file_name);
+    fs::write(&path, raw).with_context(|| format!("写入外部配置失败: {}", path.display()))?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+fn build_external_profile(
+    name: &str,
+    core_type: CoreType,
+    external_format: ExternalConfigFormat,
+    path: &str,
+) -> Profile {
+    Profile {
+        name: format!("{name} {}", new_timestamp_suffix()),
+        core_type,
+        config_type: ProfileConfigType::External,
+        external_config_format: Some(external_format),
+        external_config_path: Some(path.into()),
+        network: "tcp".into(),
+        security: "none".into(),
+        tls: false,
+        ..Profile::default()
+    }
+}
+
+fn extract_json_outbound_names(raw: &str, field: &str) -> Result<Vec<String>> {
+    let value = serde_json::from_str::<Value>(raw).context("JSON 配置解析失败")?;
+    Ok(value
+        .get("outbounds")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.get(field).and_then(Value::as_str).map(str::to_string))
+        .collect())
+}
+
+fn extract_clash_proxy_names(raw: &str) -> Result<Vec<String>> {
+    let value = serde_yaml::from_str::<serde_yaml::Value>(raw).context("Clash YAML 解析失败")?;
+    Ok(value
+        .as_mapping()
+        .and_then(|mapping| mapping.get(serde_yaml::Value::from("proxies")))
+        .and_then(serde_yaml::Value::as_sequence)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            item.as_mapping()
+                .and_then(|mapping| mapping.get(serde_yaml::Value::from("name")))
+                .and_then(serde_yaml::Value::as_str)
+                .map(str::to_string)
+        })
+        .collect())
+}
+
+fn new_timestamp_suffix() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
 }
 
 pub fn generate_runtime_bundle(config: &AppConfig) -> Result<RuntimeBundle> {
     let profile = ensure_profile(config)?;
+
+    if profile.config_type == ProfileConfigType::External {
+        return generate_external_runtime_bundle(profile, config);
+    }
 
     if config.tun.enabled && matches!(profile.core_type, CoreType::Xray) {
         let tun_protect_port = portpicker::pick_unused_port().unwrap_or(30901);
         let proxy_relay_port = portpicker::pick_unused_port().unwrap_or(30902);
         let main_config = generate_xray_config(
             profile,
+            &config.mux,
             &config.proxy,
             &config.tun,
             &config.dns,
@@ -132,56 +387,160 @@ pub fn generate_runtime_bundle(config: &AppConfig) -> Result<RuntimeBundle> {
 
         return Ok(RuntimeBundle {
             main_core_type: CoreType::Xray,
-            main_file_name: "config.json".into(),
-            main_config,
+            main_artifact: json_artifact("config.json", &main_config)?,
             helper: Some(HelperConfig {
                 core_type: CoreType::SingBox,
-                file_name: "config-helper.json".into(),
-                config: helper_config,
+                artifact: json_artifact("config-helper.json", &helper_config)?,
             }),
         });
     }
 
     let main_config = match profile.core_type {
-        CoreType::SingBox => generate_sing_box_config(profile, &config.proxy, &config.tun, &config.dns, &config.routing)?,
-        CoreType::Xray => generate_xray_config(profile, &config.proxy, &config.tun, &config.dns, &config.routing, None)?,
+        CoreType::SingBox => {
+            generate_sing_box_config(profile, &config.mux, &config.proxy, &config.tun, &config.dns, &config.routing)?
+        }
+        CoreType::Xray => {
+            generate_xray_config(profile, &config.mux, &config.proxy, &config.tun, &config.dns, &config.routing, None)?
+        }
+        CoreType::Mihomo => {
+            return Err(anyhow!("请选择导入的 Clash YAML 配置后再启动 mihomo"));
+        }
     };
 
     Ok(RuntimeBundle {
         main_core_type: profile.core_type.clone(),
-        main_file_name: "config.json".into(),
-        main_config,
+        main_artifact: json_artifact("config.json", &main_config)?,
         helper: None,
     })
 }
 
-pub fn generate_preview(config: &AppConfig) -> Result<Value> {
+pub fn generate_preview(config: &AppConfig) -> Result<String> {
     let bundle = generate_runtime_bundle(config)?;
-    let mut preview = json!({
-        "main_core_type": bundle.main_core_type,
-        "main_file_name": bundle.main_file_name,
-        "main_config": bundle.main_config,
-    });
+    let mut sections = vec![format!(
+        "# main ({})\n# file: {}\n{}",
+        bundle.main_core_type.key(),
+        bundle.main_artifact.file_name,
+        bundle.main_artifact.content
+    )];
 
     if let Some(helper) = bundle.helper {
-        preview["helper"] = json!({
-            "core_type": helper.core_type,
-            "file_name": helper.file_name,
-            "config": helper.config,
-        });
+        sections.push(format!(
+            "# helper ({})\n# file: {}\n{}",
+            helper.core_type.key(),
+            helper.artifact.file_name,
+            helper.artifact.content
+        ));
     }
 
-    Ok(preview)
+    Ok(sections.join("\n\n"))
+}
+
+fn json_artifact(file_name: &str, value: &Value) -> Result<ConfigArtifact> {
+    Ok(ConfigArtifact {
+        file_name: file_name.into(),
+        content: serde_json::to_string_pretty(value)?,
+    })
+}
+
+fn yaml_artifact(file_name: &str, content: String) -> ConfigArtifact {
+    ConfigArtifact {
+        file_name: file_name.into(),
+        content,
+    }
+}
+
+fn generate_external_runtime_bundle(profile: &Profile, config: &AppConfig) -> Result<RuntimeBundle> {
+    let external_format = profile
+        .external_config_format
+        .clone()
+        .context("外部配置缺少格式信息")?;
+    let raw = load_external_config_text(profile)?;
+
+    match (&profile.core_type, external_format) {
+        (CoreType::SingBox, ExternalConfigFormat::SingBox) => {
+            let parsed: Value = serde_json::from_str(&raw).context("sing-box 外部配置不是合法 JSON")?;
+            Ok(RuntimeBundle {
+                main_core_type: CoreType::SingBox,
+                main_artifact: json_artifact("config.json", &parsed)?,
+                helper: None,
+            })
+        }
+        (CoreType::Xray, ExternalConfigFormat::Xray) => {
+            let parsed: Value = serde_json::from_str(&raw).context("Xray 外部配置不是合法 JSON")?;
+            Ok(RuntimeBundle {
+                main_core_type: CoreType::Xray,
+                main_artifact: json_artifact("config.json", &parsed)?,
+                helper: None,
+            })
+        }
+        (CoreType::Mihomo, ExternalConfigFormat::Clash) => {
+            let patched = patch_mihomo_config(&raw, config)?;
+            Ok(RuntimeBundle {
+                main_core_type: CoreType::Mihomo,
+                main_artifact: yaml_artifact("config.yaml", patched),
+                helper: None,
+            })
+        }
+        _ => Err(anyhow!("外部配置格式与核心类型不匹配")),
+    }
+}
+
+fn load_external_config_text(profile: &Profile) -> Result<String> {
+    let path = profile
+        .external_config_path
+        .as_deref()
+        .context("外部配置缺少文件路径")?;
+    fs::read_to_string(path).with_context(|| format!("读取外部配置失败: {path}"))
+}
+
+fn patch_mihomo_config(raw: &str, config: &AppConfig) -> Result<String> {
+    let mut yaml = serde_yaml::from_str::<serde_yaml::Value>(raw).context("Clash YAML 解析失败")?;
+    let root = yaml
+        .as_mapping_mut()
+        .context("Clash YAML 根节点必须是对象")?;
+
+    root.insert(serde_yaml::Value::from("mixed-port"), serde_yaml::Value::from(config.proxy.socks_port));
+    root.insert(
+        serde_yaml::Value::from("external-controller"),
+        serde_yaml::Value::from(format!(
+            "127.0.0.1:{}",
+            clash_external_controller_port(config)
+        )),
+    );
+    root.insert(serde_yaml::Value::from("allow-lan"), serde_yaml::Value::from(false));
+    root.insert(serde_yaml::Value::from("ipv6"), serde_yaml::Value::from(config.clash.enable_ipv6));
+    root.insert(serde_yaml::Value::from("mode"), serde_yaml::Value::from(clash_mode(&config.routing.mode)));
+    root.insert(serde_yaml::Value::from("log-level"), serde_yaml::Value::from("warning"));
+    root.remove(serde_yaml::Value::from("secret"));
+
+    serde_yaml::to_string(&yaml).context("生成 mihomo 运行配置失败")
+}
+
+fn clash_external_controller_port(config: &AppConfig) -> u16 {
+    if config.clash.external_controller_port > 0 {
+        config.clash.external_controller_port
+    } else {
+        config.proxy.socks_port.saturating_add(5)
+    }
+}
+
+fn clash_mode(routing_mode: &str) -> &'static str {
+    match routing_mode {
+        "global" => "global",
+        "direct" => "direct",
+        _ => "rule",
+    }
 }
 
 fn generate_sing_box_config(
     profile: &Profile,
+    mux: &crate::models::MuxSettings,
     proxy: &ProxySettings,
     tun: &TunSettings,
     dns: &DnsSettings,
     routing: &RoutingSettings,
 ) -> Result<Value> {
-    let outbound = build_singbox_outbound(profile);
+    let outbound = build_singbox_outbound(profile, mux);
 
     let mut inbounds = vec![
         json!({
@@ -229,7 +588,7 @@ fn generate_sing_box_config(
     }))
 }
 
-fn build_singbox_outbound(profile: &Profile) -> Value {
+fn build_singbox_outbound(profile: &Profile, mux: &crate::models::MuxSettings) -> Value {
     let mut ob = json!({
         "tag": "proxy",
         "server": profile.server,
@@ -299,7 +658,36 @@ fn build_singbox_outbound(profile: &Profile) -> Value {
         }
     }
 
+    if let Some(multiplex) = singbox_multiplex_object(profile, mux) {
+        ob["multiplex"] = multiplex;
+    }
+
     ob
+}
+
+fn mux_enabled_for_profile(profile: &Profile, global_enabled: bool) -> bool {
+    match profile.mux_override {
+        MuxOverride::FollowGlobal => global_enabled,
+        MuxOverride::ForceEnable => true,
+        MuxOverride::ForceDisable => false,
+    }
+}
+
+fn singbox_multiplex_object(profile: &Profile, mux: &crate::models::MuxSettings) -> Option<Value> {
+    if !mux_enabled_for_profile(profile, mux.enabled) || mux.sing_box_protocol.is_empty() {
+        return None;
+    }
+
+    if matches!(profile.protocol, ProfileProtocol::Vless) && profile.flow.as_deref().is_some_and(|value| !value.is_empty()) {
+        return None;
+    }
+
+    Some(json!({
+        "enabled": true,
+        "protocol": mux.sing_box_protocol,
+        "max_connections": mux.sing_box_max_connections,
+        "padding": mux.sing_box_padding,
+    }))
 }
 
 fn generate_tun_helper_sing_box_config(
@@ -493,6 +881,7 @@ fn singbox_route_rules(tun: &TunSettings) -> Value {
 
 fn generate_xray_config(
     profile: &Profile,
+    mux: &crate::models::MuxSettings,
     proxy: &ProxySettings,
     tun: &TunSettings,
     dns: &DnsSettings,
@@ -573,6 +962,10 @@ fn generate_xray_config(
         outbound["streamSettings"]["sockopt"] = json!({
             "dialerProxy": "tun-protect-ss"
         });
+    }
+
+    if let Some(mux_object) = xray_mux_object(profile, mux) {
+        outbound["mux"] = mux_object;
     }
 
     let mut inbounds = vec![
@@ -661,6 +1054,42 @@ fn generate_xray_config(
             "rules": rules
         }
     }))
+}
+
+fn xray_mux_object(profile: &Profile, mux: &crate::models::MuxSettings) -> Option<Value> {
+    if !mux_enabled_for_profile(profile, mux.enabled) {
+        return None;
+    }
+
+    match profile.protocol {
+        ProfileProtocol::Vmess => Some(json!({
+            "enabled": true,
+            "concurrency": mux.xray_concurrency.unwrap_or(8),
+        })),
+        ProfileProtocol::Vless => {
+            if profile.flow.as_deref().is_some_and(|value| !value.is_empty()) {
+                None
+            } else {
+                Some(json!({
+                    "enabled": true,
+                    "xudpConcurrency": mux.xray_xudp_concurrency.unwrap_or(16),
+                    "xudpProxyUDP443": mux
+                        .xray_xudp_proxy_udp_443
+                        .clone()
+                        .unwrap_or_else(|| "reject".into()),
+                }))
+            }
+        }
+        ProfileProtocol::Trojan | ProfileProtocol::Shadowsocks => Some(json!({
+            "enabled": true,
+            "xudpConcurrency": mux.xray_xudp_concurrency.unwrap_or(16),
+            "xudpProxyUDP443": mux
+                .xray_xudp_proxy_udp_443
+                .clone()
+                .unwrap_or_else(|| "reject".into()),
+        })),
+        _ => None,
+    }
 }
 
 fn tls_object(profile: &Profile) -> Option<Value> {
