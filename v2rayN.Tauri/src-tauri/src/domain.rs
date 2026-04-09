@@ -795,7 +795,107 @@ fn patch_mihomo_config(raw: &str, config: &AppConfig) -> Result<String> {
         merge_yaml_mapping(root, mixin);
     }
 
+    let injected_rules = mihomo_user_rules(config, root);
+    if !injected_rules.is_empty() {
+        let rules_key = serde_yaml::Value::from("rules");
+        let existing_rules = root
+            .remove(&rules_key)
+            .and_then(|value| value.as_sequence().cloned())
+            .unwrap_or_default();
+        let mut merged_rules = injected_rules
+            .iter()
+            .map(|rule| serde_yaml::Value::from(rule.clone()))
+            .collect::<Vec<_>>();
+        merged_rules.extend(existing_rules);
+        root.insert(rules_key, serde_yaml::Value::Sequence(merged_rules));
+    }
+
     serde_yaml::to_string(&yaml).context("生成 mihomo 运行配置失败")
+}
+
+fn mihomo_user_rules(config: &AppConfig, root: &serde_yaml::Mapping) -> Vec<String> {
+    let Some(active) = active_routing_item(&config.routing) else {
+        return Vec::new();
+    };
+    let proxy_policy = mihomo_proxy_policy(root);
+    let mut rules = Vec::new();
+    for rule in &active.rule_set {
+        if !rule.enabled || matches!(rule.rule_type, RoutingRuleType::Dns) {
+            continue;
+        }
+        let policy = match normalize_outbound_tag(rule.outbound_tag.as_deref()) {
+            "direct" => "DIRECT",
+            "block" => "REJECT",
+            _ => proxy_policy.as_str(),
+        };
+
+        for value in rule.domain.iter().filter(|value| !value.trim().is_empty()) {
+            if let Some(line) = mihomo_domain_rule(value, policy) {
+                rules.push(line);
+            }
+        }
+        for value in rule.ip.iter().filter(|value| !value.trim().is_empty()) {
+            if let Some(line) = mihomo_ip_rule(value, policy) {
+                rules.push(line);
+            }
+        }
+        for value in rule.process.iter().filter(|value| !value.trim().is_empty()) {
+            rules.push(format!("PROCESS-NAME,{},{}", value, policy));
+        }
+    }
+    rules
+}
+
+fn mihomo_proxy_policy(root: &serde_yaml::Mapping) -> String {
+    root.get(serde_yaml::Value::from("rules"))
+        .and_then(serde_yaml::Value::as_sequence)
+        .and_then(|rules| {
+            rules.iter().rev().find_map(|item| {
+                let line = item.as_str()?;
+                let mut parts = line.split(',').map(str::trim);
+                if parts.next()? != "MATCH" {
+                    return None;
+                }
+                parts.next().map(ToString::to_string)
+            })
+        })
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "DIRECT".to_string())
+}
+
+fn mihomo_domain_rule(value: &str, policy: &str) -> Option<String> {
+    if value.starts_with('#') || value.starts_with("ext:") || value.starts_with("ext-domain:") {
+        return None;
+    }
+    if let Some(tag) = value.strip_prefix("geosite:") {
+        return Some(format!("RULE-SET,geosite-{},{}", tag, policy));
+    }
+    if let Some(pattern) = value.strip_prefix("domain:") {
+        return Some(format!("DOMAIN-SUFFIX,{},{}", pattern, policy));
+    }
+    if let Some(pattern) = value.strip_prefix("full:") {
+        return Some(format!("DOMAIN,{},{}", pattern, policy));
+    }
+    if let Some(pattern) = value.strip_prefix("keyword:") {
+        return Some(format!("DOMAIN-KEYWORD,{},{}", pattern, policy));
+    }
+    if let Some(pattern) = value.strip_prefix("dotless:") {
+        return Some(format!("DOMAIN-KEYWORD,{},{}", pattern, policy));
+    }
+    if value.starts_with("regexp:") {
+        return None;
+    }
+    Some(format!("DOMAIN,{},{}", value.replace("\\,", ","), policy))
+}
+
+fn mihomo_ip_rule(value: &str, policy: &str) -> Option<String> {
+    if value.starts_with("ext:") || value.starts_with("ext-ip:") {
+        return None;
+    }
+    if let Some(tag) = value.strip_prefix("geoip:") {
+        return Some(format!("GEOIP,{},{}", tag, policy));
+    }
+    Some(format!("IP-CIDR,{},{}", value, policy))
 }
 
 fn clash_external_controller_port(config: &AppConfig) -> u16 {

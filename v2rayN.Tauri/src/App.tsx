@@ -470,8 +470,15 @@ function App() {
       const nextStatus = await desktopApi.getStatus()
       if (nextStatus && nextStatus.config) {
         setStatus(nextStatus)
-        setConfig(nextStatus.config)
-        setSelectedProfileId(nextStatus.config.selected_profile_id ?? nextStatus.config.profiles[0]?.id ?? '')
+        setConfig((current) => {
+          if (current && autosavePendingRef.current) {
+            return current
+          }
+          return nextStatus.config
+        })
+        if (!autosavePendingRef.current) {
+          setSelectedProfileId(nextStatus.config.selected_profile_id ?? nextStatus.config.profiles[0]?.id ?? '')
+        }
       }
     } catch (error) {
       console.error('[loadStatus] failed:', error)
@@ -496,8 +503,15 @@ function App() {
     const nextStatus = await desktopApi.getStatus()
     if (nextStatus && nextStatus.config) {
       setStatus(nextStatus)
-      setConfig(nextStatus.config)
-      setSelectedProfileId(nextStatus.config.selected_profile_id ?? nextStatus.config.profiles[0]?.id ?? '')
+      setConfig((current) => {
+        if (current && autosavePendingRef.current) {
+          return current
+        }
+        return nextStatus.config
+      })
+      if (!autosavePendingRef.current) {
+        setSelectedProfileId(nextStatus.config.selected_profile_id ?? nextStatus.config.profiles[0]?.id ?? '')
+      }
     }
     return nextStatus
   }
@@ -669,21 +683,21 @@ function App() {
   function buildConfigWithDrafts(baseConfig: AppConfig) {
     const draft = structuredClone(baseConfig)
 
-    if (profileDraft) {
+    if (profileDraftDirtyRef.current && profileDraft) {
       const target = draft.profiles.find((profile) => profile.id === profileDraft.id)
       if (target) {
         Object.assign(target, profileDraft)
       }
     }
 
-    if (routingDraft) {
+    if (routingDraftDirtyRef.current && routingDraft) {
       const target = draft.routing.items.find((item) => item.id === routingDraft.id)
       if (target) {
         Object.assign(target, routingDraft)
       }
     }
 
-    if (routingRuleDraft && selectedRoutingId) {
+    if (routingRuleDraftDirtyRef.current && routingRuleDraft && selectedRoutingId) {
       const target = draft.routing.items
         .find((item) => item.id === selectedRoutingId)
         ?.rule_set.find((rule) => rule.id === routingRuleDraft.id)
@@ -1592,11 +1606,12 @@ function App() {
                     />
                   </div>
                   <div className="mt-4 flex flex-wrap gap-3">
-                    <button className="rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200" onClick={() => void handleSystemProxy(true)}>
-                      开启系统代理
-                    </button>
-                    <button className="rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200" onClick={() => void handleSystemProxy(false)}>
-                      关闭系统代理
+                    <button
+                      className="rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 disabled:cursor-not-allowed disabled:opacity-50"
+                      disabled={busyAction === 'proxy-on' || busyAction === 'proxy-off'}
+                      onClick={() => void handleSystemProxy(!config.proxy.use_system_proxy)}
+                    >
+                      {config.proxy.use_system_proxy ? '关闭系统代理' : '开启系统代理'}
                     </button>
                     <button
                       className="rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200"
@@ -2317,11 +2332,11 @@ function App() {
                   </Field>
                 </div>
                 <div className="mt-4 flex gap-3">
-                  <ActionButton busy={busyAction === 'proxy-on'} onClick={() => void handleSystemProxy(true)}>
-                    开启系统代理
-                  </ActionButton>
-                  <ActionButton busy={busyAction === 'proxy-off'} onClick={() => void handleSystemProxy(false)}>
-                    关闭系统代理
+                  <ActionButton
+                    busy={busyAction === 'proxy-on' || busyAction === 'proxy-off'}
+                    onClick={() => void handleSystemProxy(!config.proxy.use_system_proxy)}
+                  >
+                    {config.proxy.use_system_proxy ? '关闭系统代理' : '开启系统代理'}
                   </ActionButton>
                 </div>
               </SectionCard>
