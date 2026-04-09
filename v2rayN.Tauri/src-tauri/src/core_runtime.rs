@@ -88,6 +88,7 @@ impl RuntimeManager {
                 &executable,
                 &bundle.main_core_type,
                 &config_path,
+                Some(config_path.to_string_lossy().as_ref()),
                 runtime_envs(&bundle.main_core_type, store),
                 "core-main",
             )?;
@@ -125,6 +126,7 @@ impl RuntimeManager {
                 &helper_executable,
                 &helper.core_type,
                 &helper_path,
+                Some(helper_path.to_string_lossy().as_ref()),
                 runtime_envs(&helper.core_type, store),
                 "core-helper",
             )?;
@@ -202,6 +204,7 @@ fn start_elevated_core(
     executable: &Path,
     core_type: &CoreType,
     config_path: &Path,
+    cleanup_config_path: Option<&str>,
     envs: Vec<(String, String)>,
     log_name: &str,
 ) -> Result<u32> {
@@ -213,6 +216,7 @@ fn start_elevated_core(
         &args,
         &envs,
         &log_path,
+        cleanup_config_path,
     )?;
     bind_log_file(events.clone(), log_path, log_name.to_string());
     Ok(pid)
@@ -276,8 +280,8 @@ fn health_check_children(children: &mut [Child]) -> Result<()> {
 
 fn health_check_elevated_pids(pids: &[u32]) -> Result<()> {
     for pid in pids {
-        let status = Command::new("kill")
-            .args(["-0", &pid.to_string()])
+        let status = Command::new("ps")
+            .args(["-p", &pid.to_string()])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();

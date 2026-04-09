@@ -11,12 +11,13 @@ pub fn start_elevated_process(
     args: &[String],
     envs: &[(String, String)],
     log_path: &Path,
+    cleanup_config_path: Option<&str>,
 ) -> Result<u32> {
     if let Some(parent) = log_path.parent() {
         fs::create_dir_all(parent)?;
     }
 
-    let command = build_shell_command(working_directory, executable, args, envs, log_path);
+    let command = build_shell_command(working_directory, executable, args, envs, log_path, cleanup_config_path);
     let script = format!("do shell script {} with administrator privileges", apple_script_quote(&command));
     let output = Command::new("osascript")
         .arg("-e")
@@ -26,7 +27,13 @@ pub fn start_elevated_process(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("提权启动失败: {}", stderr.trim()));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail = stderr.trim();
+        let fallback = stdout.trim();
+        return Err(anyhow!(
+            "提权启动失败: {}",
+            if detail.is_empty() { fallback } else { detail }
+        ));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -58,6 +65,7 @@ fn build_shell_command(
     args: &[String],
     envs: &[(String, String)],
     log_path: &Path,
+    cleanup_config_path: Option<&str>,
 ) -> String {
     let env_assignment = envs
         .iter()
@@ -81,8 +89,21 @@ fn build_shell_command(
         format!("{env_assignment} ")
     };
 
+    let cleanup = cleanup_config_path
+        .map(|cfg_path| {
+            let escaped = cfg_path.replace('\'', "'\\''");
+            format!(
+                "for p in $(pgrep -f '[s]ing-box.*{escaped}' 2>/dev/null); do \
+c=$(ps -p \"$p\" -o comm= 2>/dev/null); c=${{c##*/}}; \
+[ \"$c\" = \"sing-box\" ] || continue; \
+kill -9 \"$p\" 2>/dev/null; \
+done; sleep 1; "
+            )
+        })
+        .unwrap_or_default();
+
     format!(
-        "cd {working_directory} && {env_prefix}{executable} {args} > {log_path} 2>&1 & echo $!"
+        "{cleanup}(cd {working_directory} && exec {env_prefix}{executable} {args} > {log_path} 2>&1 < /dev/null) </dev/null >/dev/null 2>/dev/null & echo $!"
     )
 }
 

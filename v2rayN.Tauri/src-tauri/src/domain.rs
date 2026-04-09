@@ -990,6 +990,7 @@ fn generate_sing_box_config(
 ) -> Result<Value> {
     let outbound = build_singbox_outbound(profile, mux);
     let (route_rules, route_rule_sets) = singbox_route_rules(tun, routing);
+    let (dns_block, dns_rule_sets) = singbox_dns_block(dns, routing);
 
     let mut inbounds = vec![
         json!({
@@ -1019,17 +1020,23 @@ fn generate_sing_box_config(
         "rules": route_rules,
         "default_domain_resolver": {
             "server": "bootstrap",
-            "strategy": active_singbox_domain_strategy(routing),
+            "strategy": singbox_dns_strategy(routing),
         }
     });
-    route["rule_set"] = Value::Array(singbox_rule_set_entries(&route_rule_sets));
+    let merged_rule_sets = route_rule_sets
+        .into_iter()
+        .chain(dns_rule_sets)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    route["rule_set"] = Value::Array(singbox_rule_set_entries(&merged_rule_sets));
 
     Ok(json!({
         "log": {
             "level": "warn",
             "timestamp": true,
         },
-        "dns": singbox_dns_block(dns, routing),
+        "dns": dns_block,
         "inbounds": inbounds,
         "outbounds": [
             outbound,
@@ -1152,14 +1159,23 @@ fn generate_tun_helper_sing_box_config(
     proxy_relay_port: u16,
 ) -> Value {
     let interface_name = resolve_tun_interface_name(tun);
-    let static_rule_sets = vec!["geosite-cn".to_string(), "geoip-cn".to_string()];
+    let (dns_block, dns_rule_sets) = singbox_dns_block(dns, routing);
+    let static_rule_sets = [
+        "geosite-cn".to_string(),
+        "geoip-cn".to_string(),
+    ]
+    .into_iter()
+    .chain(dns_rule_sets)
+    .collect::<BTreeSet<_>>()
+    .into_iter()
+    .collect::<Vec<_>>();
 
     json!({
         "log": {
             "level": "warn",
             "timestamp": true
         },
-        "dns": singbox_dns_block(dns, routing),
+        "dns": dns_block,
         "inbounds": [
             {
                 "type": "tun",
@@ -1195,7 +1211,10 @@ fn generate_tun_helper_sing_box_config(
         "route": {
             "auto_detect_interface": true,
             "final": singbox_final_outbound(routing),
-            "default_domain_resolver": { "server": "bootstrap" },
+            "default_domain_resolver": {
+                "server": "bootstrap",
+                "strategy": singbox_dns_strategy(routing)
+            },
             "rules": [
                 { "inbound": ["tun-protect-ss"], "outbound": "direct" },
                 { "network": "udp", "port": [135, 137, 138, 139, 5353], "action": "reject" },
@@ -1239,7 +1258,7 @@ fn singbox_final_outbound(routing: &RoutingSettings) -> &'static str {
 
 const BOOTSTRAP_DNS_ADDRESS: &str = "223.5.5.5";
 
-fn singbox_dns_block(dns: &DnsSettings, routing: &RoutingSettings) -> Value {
+fn singbox_dns_block(dns: &DnsSettings, routing: &RoutingSettings) -> (Value, Vec<String>) {
     let mut bootstrap = parse_dns_server_new_format(BOOTSTRAP_DNS_ADDRESS);
     bootstrap["tag"] = json!("bootstrap");
 
@@ -1286,14 +1305,16 @@ fn singbox_dns_block(dns: &DnsSettings, routing: &RoutingSettings) -> Value {
         }
     }
 
-    json!({
-        "servers": [bootstrap, remote, local],
-        "rules": rules,
-        "final": "remote",
-        "independent_cache": true,
-        "strategy": singbox_dns_strategy(routing),
-        "rule_set": singbox_rule_set_entries(&collected_rule_sets.into_iter().collect::<Vec<_>>())
-    })
+    (
+        json!({
+            "servers": [bootstrap, remote, local],
+            "rules": rules,
+            "final": "remote",
+            "independent_cache": true,
+            "strategy": singbox_dns_strategy(routing)
+        }),
+        collected_rule_sets.into_iter().collect(),
+    )
 }
 
 fn parse_dns_server_new_format(address: &str) -> Value {
@@ -1618,7 +1639,7 @@ fn singbox_route_rules(tun: &TunSettings, routing: &RoutingSettings) -> (Value, 
     rules.push(json!({ "outbound": "direct", "clash_mode": "Direct" }));
     rules.push(json!({ "outbound": "proxy", "clash_mode": "Global" }));
 
-    let resolve_strategy = active_singbox_domain_strategy(routing);
+    let resolve_strategy = singbox_dns_strategy(routing);
     let mut ip_rules = Vec::new();
     if routing.domain_strategy == "IPOnDemand" {
         rules.push(json!({
