@@ -18,7 +18,11 @@ impl ConfigStore {
             .path()
             .app_local_data_dir()
             .context("无法解析应用数据目录")?;
+        Self::bootstrap_at(base)
+    }
 
+    /// 独立模式初始化（不依赖 Tauri），使用指定数据目录。
+    pub fn bootstrap_at(base: PathBuf) -> Result<Self> {
         let paths = AppPaths {
             root: base.to_string_lossy().to_string(),
             bin: base.join("bin").to_string_lossy().to_string(),

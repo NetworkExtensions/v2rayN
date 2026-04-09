@@ -2,6 +2,7 @@ use crate::{
     config_store::ConfigStore,
     core_update::{resolve_executable, CorePaths},
     domain::generate_runtime_bundle,
+    events::EventSender,
     models::{CoreLogEvent, CoreType, RunningStatus},
     tun,
 };
@@ -15,7 +16,6 @@ use std::{
     thread,
     time::Duration,
 };
-use tauri::{AppHandle, Emitter};
 
 const HEALTH_CHECK_DELAY: Duration = Duration::from_millis(1500);
 
@@ -63,7 +63,7 @@ impl RuntimeManager {
 
     pub fn start(
         &self,
-        app: &AppHandle,
+        events: &EventSender,
         store: &ConfigStore,
         core_paths: &CorePaths,
     ) -> Result<RunningStatus> {
@@ -82,7 +82,7 @@ impl RuntimeManager {
 
         let main_process = if config.tun.enabled && matches!(bundle.main_core_type, CoreType::SingBox) {
             let pid = start_elevated_core(
-                app,
+                events,
                 &store.paths().bin_configs,
                 &store.paths().gui_logs,
                 &executable,
@@ -95,7 +95,7 @@ impl RuntimeManager {
             (Some(pid), true)
         } else {
             let child = start_direct_core(
-                app,
+                events,
                 &store.paths().bin_configs,
                 &executable,
                 &bundle.main_core_type,
@@ -119,7 +119,7 @@ impl RuntimeManager {
             fs::write(&helper_path, helper.artifact.content.as_bytes())?;
 
             let pid = start_elevated_core(
-                app,
+                events,
                 &store.paths().bin_configs,
                 &store.paths().gui_logs,
                 &helper_executable,
@@ -170,7 +170,7 @@ fn runtime_envs(core_type: &CoreType, store: &ConfigStore) -> Vec<(String, Strin
 }
 
 fn start_direct_core(
-    app: &AppHandle,
+    events: &EventSender,
     working_directory: &str,
     executable: &Path,
     core_type: &CoreType,
@@ -190,13 +190,13 @@ fn start_direct_core(
         .stderr(Stdio::piped());
 
     let mut child = command.spawn().context("启动核心失败")?;
-    bind_log_stream(app, child.stdout.take(), format!("{log_source}-stdout"));
-    bind_log_stream(app, child.stderr.take(), format!("{log_source}-stderr"));
+    bind_log_stream(events.clone(), child.stdout.take(), format!("{log_source}-stdout"));
+    bind_log_stream(events.clone(), child.stderr.take(), format!("{log_source}-stderr"));
     Ok(child)
 }
 
 fn start_elevated_core(
-    app: &AppHandle,
+    events: &EventSender,
     working_directory: &str,
     log_directory: &str,
     executable: &Path,
@@ -214,7 +214,7 @@ fn start_elevated_core(
         &envs,
         &log_path,
     )?;
-    bind_log_file(app, log_path, log_name.to_string());
+    bind_log_file(events.clone(), log_path, log_name.to_string());
     Ok(pid)
 }
 
@@ -239,23 +239,19 @@ fn apply_core_command(command: &mut Command, core_type: &CoreType, config_path: 
     command.args(core_args(core_type, config_path));
 }
 
-fn bind_log_stream(app: &AppHandle, stream: Option<impl std::io::Read + Send + 'static>, source: String) {
+fn bind_log_stream(events: EventSender, stream: Option<impl std::io::Read + Send + 'static>, source: String) {
     let Some(stream) = stream else {
         return;
     };
 
-    let app = app.clone();
     thread::spawn(move || {
         let reader = BufReader::new(stream);
         for line in reader.lines().map_while(|line| line.ok()) {
-            let _ = app.emit(
-                "core-log",
-                CoreLogEvent {
-                    level: if source.ends_with("stderr") { "error".into() } else { "info".into() },
-                    source: source.clone(),
-                    message: line,
-                },
-            );
+            events.emit_core_log(CoreLogEvent {
+                level: if source.ends_with("stderr") { "error".into() } else { "info".into() },
+                source: source.clone(),
+                message: line,
+            });
         }
     });
 }
@@ -269,7 +265,7 @@ fn health_check_children(children: &mut [Child]) -> Result<()> {
                     "核心进程启动后立即退出 (exit code {code})，请检查日志"
                 ));
             }
-            Ok(None) => {} // still running
+            Ok(None) => {}
             Err(e) => {
                 return Err(anyhow!("检查核心进程状态失败: {e}"));
             }
@@ -286,7 +282,7 @@ fn health_check_elevated_pids(pids: &[u32]) -> Result<()> {
             .stderr(Stdio::null())
             .status();
         match status {
-            Ok(s) if s.success() => {} // still running
+            Ok(s) if s.success() => {}
             _ => {
                 return Err(anyhow!(
                     "提权核心进程 (PID {pid}) 启动后立即退出，请检查日志"
@@ -297,8 +293,7 @@ fn health_check_elevated_pids(pids: &[u32]) -> Result<()> {
     Ok(())
 }
 
-fn bind_log_file(app: &AppHandle, path: PathBuf, source: String) {
-    let app = app.clone();
+fn bind_log_file(events: EventSender, path: PathBuf, source: String) {
     thread::spawn(move || {
         let mut cursor = 0u64;
         let mut remainder = String::new();
@@ -326,14 +321,11 @@ fn bind_log_file(app: &AppHandle, path: PathBuf, source: String) {
                             }
 
                             for line in lines {
-                                let _ = app.emit(
-                                    "core-log",
-                                    CoreLogEvent {
-                                        level: "info".into(),
-                                        source: source.clone(),
-                                        message: line,
-                                    },
-                                );
+                                events.emit_core_log(CoreLogEvent {
+                                    level: "info".into(),
+                                    source: source.clone(),
+                                    message: line,
+                                });
                             }
                         }
                     }

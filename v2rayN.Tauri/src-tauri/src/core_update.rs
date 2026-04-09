@@ -11,7 +11,6 @@ use std::{
     process::Command,
 };
 use tar::Archive;
-use tauri::AppHandle;
 use zip::ZipArchive;
 
 #[derive(Debug, Clone)]
@@ -37,8 +36,7 @@ struct GithubAsset {
     browser_download_url: String,
 }
 
-pub fn list_core_statuses(app: &AppHandle, core_paths: &CorePaths) -> Result<Vec<CoreAssetStatus>> {
-    let _ = app;
+pub fn list_core_statuses(core_paths: &CorePaths) -> Result<Vec<CoreAssetStatus>> {
     [CoreType::Xray, CoreType::SingBox, CoreType::Mihomo]
         .iter()
         .map(|core_type| core_status(core_paths, core_type.clone()))
@@ -52,8 +50,7 @@ pub fn list_local_core_statuses(core_paths: &CorePaths) -> Result<Vec<CoreAssetS
         .collect()
 }
 
-pub fn download_core(app: &AppHandle, core_paths: &CorePaths, core_type: CoreType) -> Result<CoreAssetStatus> {
-    let _ = app;
+pub fn download_core(core_paths: &CorePaths, core_type: CoreType) -> Result<CoreAssetStatus> {
     let release = fetch_release(&core_type)?;
     let asset = select_asset(&core_type, &release.assets)?;
     let directory = core_paths.executable_dir(&core_type);

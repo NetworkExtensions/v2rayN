@@ -332,10 +332,13 @@ function App() {
   async function loadStatus() {
     try {
       const nextStatus = await desktopApi.getStatus()
-      setStatus(nextStatus)
-      setConfig(nextStatus.config)
-      setSelectedProfileId(nextStatus.config.selected_profile_id ?? nextStatus.config.profiles[0]?.id ?? '')
+      if (nextStatus && nextStatus.config) {
+        setStatus(nextStatus)
+        setConfig(nextStatus.config)
+        setSelectedProfileId(nextStatus.config.selected_profile_id ?? nextStatus.config.profiles[0]?.id ?? '')
+      }
     } catch (error) {
+      console.error('[loadStatus] failed:', error)
       setMessage(String(error))
     }
   }
@@ -355,9 +358,11 @@ function App() {
 
   async function syncRuntimeStatus() {
     const nextStatus = await desktopApi.getStatus()
-    setStatus(nextStatus)
-    setConfig(nextStatus.config)
-    setSelectedProfileId(nextStatus.config.selected_profile_id ?? nextStatus.config.profiles[0]?.id ?? '')
+    if (nextStatus && nextStatus.config) {
+      setStatus(nextStatus)
+      setConfig(nextStatus.config)
+      setSelectedProfileId(nextStatus.config.selected_profile_id ?? nextStatus.config.profiles[0]?.id ?? '')
+    }
     return nextStatus
   }
 
@@ -648,34 +653,57 @@ function App() {
     setBusyAction('start')
     try {
       await desktopApi.startCore()
-      const nextStatus = await syncRuntimeStatus()
+    } catch (error) {
+      console.error('[handleStart] startCore failed:', error)
+      setMessage(String(error))
+      setBusyAction(null)
+      return
+    }
+
+    let nextStatus: AppStatus | null = null
+    try {
+      nextStatus = await syncRuntimeStatus()
       setMessage('核心已启动')
       setPreviewStale(true)
+    } catch (error) {
+      console.error('[handleStart] syncRuntimeStatus failed:', error)
+      setMessage(`核心可能已启动，但状态刷新失败: ${error}`)
+    }
+
+    try {
       await refreshProbe()
-      if (nextStatus.runtime.core_type === 'mihomo') {
+    } catch (error) {
+      console.error('[handleStart] refreshProbe failed:', error)
+    }
+
+    try {
+      if (nextStatus?.runtime.core_type === 'mihomo') {
         await refreshClashState()
       }
     } catch (error) {
-      setMessage(String(error))
-    } finally {
-      setBusyAction(null)
+      console.error('[handleStart] refreshClashState failed:', error)
     }
+
+    setBusyAction(null)
   }
 
   async function handleStop() {
     setBusyAction('stop')
     try {
       await desktopApi.stopCore()
-      await syncRuntimeStatus()
-      setMessage('核心已停止')
-      setClashProxyGroups([])
-      setClashConnections([])
-      await refreshProbe()
     } catch (error) {
+      console.error('[handleStop] stopCore failed:', error)
       setMessage(String(error))
-    } finally {
       setBusyAction(null)
+      return
     }
+
+    try { await syncRuntimeStatus() } catch (e) { console.error('[handleStop] sync failed:', e) }
+    setMessage('核心已停止')
+    setClashProxyGroups([])
+    setClashConnections([])
+    try { await refreshProbe() } catch (e) { console.error('[handleStop] probe failed:', e) }
+    setBusyAction(null)
   }
 
   async function handleRestart() {
@@ -687,18 +715,32 @@ function App() {
     setBusyAction('restart')
     try {
       await desktopApi.restartCore()
-      const nextStatus = await syncRuntimeStatus()
+    } catch (error) {
+      console.error('[handleRestart] restartCore failed:', error)
+      setMessage(String(error))
+      setBusyAction(null)
+      return
+    }
+
+    let nextStatus: AppStatus | null = null
+    try {
+      nextStatus = await syncRuntimeStatus()
       setMessage('核心已重启')
       setPreviewStale(true)
-      await refreshProbe()
-      if (nextStatus.runtime.core_type === 'mihomo') {
+    } catch (e) {
+      console.error('[handleRestart] sync failed:', e)
+      setMessage(`核心可能已重启，但状态刷新失败: ${e}`)
+    }
+
+    try { await refreshProbe() } catch (e) { console.error('[handleRestart] probe failed:', e) }
+
+    try {
+      if (nextStatus?.runtime.core_type === 'mihomo') {
         await refreshClashState()
       }
-    } catch (error) {
-      setMessage(String(error))
-    } finally {
-      setBusyAction(null)
-    }
+    } catch (e) { console.error('[handleRestart] clash failed:', e) }
+
+    setBusyAction(null)
   }
 
   async function handleSystemProxy(enabled: boolean) {

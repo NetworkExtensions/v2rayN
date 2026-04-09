@@ -15,15 +15,11 @@ use reqwest::Proxy;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::thread;
-use std::time::Duration;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::State;
 
-fn load_status(
-    _app: &AppHandle,
-    state: &SharedState,
-    core_assets: Vec<CoreAssetStatus>,
-    include_probe: bool,
-) -> Result<AppStatus> {
+// ── 内部辅助函数 ─────────────────────────────────────────────────────────────
+
+pub fn load_status(state: &SharedState, core_assets: Vec<CoreAssetStatus>, include_probe: bool) -> Result<AppStatus> {
     let config = state.store.load()?;
     let proxy_probe = if include_probe && state.runtime.status().running {
         network_probe::probe_proxy(config.proxy.socks_port).ok()
@@ -41,7 +37,7 @@ fn load_status(
     })
 }
 
-fn build_client(user_agent: &str, proxy_url: Option<&str>) -> Result<Client> {
+pub fn build_client(user_agent: &str, proxy_url: Option<&str>) -> Result<Client> {
     let mut builder = Client::builder().user_agent(user_agent);
     if let Some(proxy_url) = proxy_url {
         builder = builder.proxy(Proxy::all(proxy_url)?);
@@ -49,7 +45,7 @@ fn build_client(user_agent: &str, proxy_url: Option<&str>) -> Result<Client> {
     builder.build().context("创建 HTTP 客户端失败")
 }
 
-fn load_cached_core_assets(state: &SharedState) -> Result<Vec<CoreAssetStatus>> {
+pub fn load_cached_core_assets(state: &SharedState) -> Result<Vec<CoreAssetStatus>> {
     let cached = state
         .core_status_cache
         .lock()
@@ -62,7 +58,7 @@ fn load_cached_core_assets(state: &SharedState) -> Result<Vec<CoreAssetStatus>> 
     }
 }
 
-fn update_core_status_cache(state: &SharedState, statuses: &[CoreAssetStatus]) -> Result<()> {
+pub fn update_core_status_cache(state: &SharedState, statuses: &[CoreAssetStatus]) -> Result<()> {
     let mut cache = state
         .core_status_cache
         .lock()
@@ -185,7 +181,7 @@ pub fn auto_refresh_due_subscriptions(state: &SharedState) -> Result<bool> {
         }
 
         changed = true;
-        thread::sleep(Duration::from_secs(1));
+        thread::sleep(std::time::Duration::from_secs(1));
     }
 
     if changed {
@@ -195,17 +191,42 @@ pub fn auto_refresh_due_subscriptions(state: &SharedState) -> Result<bool> {
     Ok(changed)
 }
 
+pub fn refresh_all_subscriptions_impl(core_type: CoreType, state: &SharedState) -> Result<AppConfig> {
+    let _guard = state
+        .subscription_refresh_lock
+        .lock()
+        .map_err(|_| anyhow::anyhow!("订阅刷新锁不可用"))?;
+    let mut config = state.store.load()?;
+    let import_dir = PathBuf::from(state.store.paths().bin_configs).join("imported");
+    let socks_port = config.proxy.socks_port;
+
+    for index in 0..config.subscriptions.len() {
+        let subscription = &config.subscriptions[index];
+        if !subscription.enabled || subscription.url.trim().is_empty() {
+            continue;
+        }
+        if let Err(error) = refresh_subscription_impl(&mut config, index, core_type.clone(), socks_port, &import_dir) {
+            domain::apply_subscription_error(&mut config.subscriptions[index], error.to_string());
+        }
+    }
+
+    state.store.save(&config)?;
+    Ok(config)
+}
+
+// ── Tauri 命令 ───────────────────────────────────────────────────────────────
+
 #[tauri::command]
-pub fn get_app_status(app: AppHandle, state: State<'_, SharedState>) -> Result<AppStatus, String> {
-    let core_assets = crate::core_update::list_core_statuses(&app, &state.core_paths).map_err(error_to_string)?;
+pub fn get_app_status(state: State<'_, SharedState>) -> Result<AppStatus, String> {
+    let core_assets = crate::core_update::list_core_statuses(&state.core_paths).map_err(error_to_string)?;
     update_core_status_cache(&state, &core_assets).map_err(error_to_string)?;
-    load_status(&app, &state, core_assets, true).map_err(error_to_string)
+    load_status(&state, core_assets, true).map_err(error_to_string)
 }
 
 #[tauri::command]
-pub fn get_app_status_light(app: AppHandle, state: State<'_, SharedState>) -> Result<AppStatus, String> {
+pub fn get_app_status_light(state: State<'_, SharedState>) -> Result<AppStatus, String> {
     let core_assets = load_cached_core_assets(&state).map_err(error_to_string)?;
-    load_status(&app, &state, core_assets, false).map_err(error_to_string)
+    load_status(&state, core_assets, false).map_err(error_to_string)
 }
 
 #[tauri::command]
@@ -489,51 +510,25 @@ pub fn refresh_all_subscriptions(core_type: CoreType, state: State<'_, SharedSta
     refresh_all_subscriptions_impl(core_type, &state).map_err(error_to_string)
 }
 
-fn refresh_all_subscriptions_impl(core_type: CoreType, state: &SharedState) -> Result<AppConfig> {
-    let _guard = state
-        .subscription_refresh_lock
-        .lock()
-        .map_err(|_| anyhow::anyhow!("订阅刷新锁不可用"))?;
-    let mut config = state.store.load()?;
-    let import_dir = PathBuf::from(state.store.paths().bin_configs).join("imported");
-    let socks_port = config.proxy.socks_port;
-
-    for index in 0..config.subscriptions.len() {
-        let subscription = &config.subscriptions[index];
-        if !subscription.enabled || subscription.url.trim().is_empty() {
-            continue;
-        }
-        if let Err(error) = refresh_subscription_impl(&mut config, index, core_type.clone(), socks_port, &import_dir) {
-            domain::apply_subscription_error(&mut config.subscriptions[index], error.to_string());
-        }
-    }
-
-    state.store.save(&config)?;
-    Ok(config)
-}
-
 #[tauri::command]
 pub fn refresh_all_subscriptions_in_background(
-    app: AppHandle,
     core_type: CoreType,
+    state: State<'_, SharedState>,
 ) -> Result<(), String> {
+    let state_clone = (*state).clone();
     thread::spawn(move || {
-        let state = app.state::<SharedState>();
-        let result = refresh_all_subscriptions_impl(core_type, &state);
+        let result = refresh_all_subscriptions_impl(core_type, &state_clone);
         let message = match &result {
             Ok(_) => "全部订阅刷新完成".to_string(),
             Err(error) => error.to_string(),
         };
-        let _ = app.emit(
-            "background-task-finished",
-            BackgroundTaskEvent {
-                task: "subscription-refresh-all".into(),
-                success: result.is_ok(),
-                message,
-            },
-        );
+        state_clone.event_sender.emit_background_task(BackgroundTaskEvent {
+            task: "subscription-refresh-all".into(),
+            success: result.is_ok(),
+            message,
+        });
         if result.is_ok() {
-            let _ = app.emit("app-state-changed", "subscription_refresh_all");
+            state_clone.event_sender.emit_app_state_changed("subscription_refresh_all");
         }
     });
     Ok(())
@@ -575,19 +570,18 @@ pub fn generate_config_preview(state: State<'_, SharedState>) -> Result<String, 
 }
 
 #[tauri::command]
-pub fn check_core_assets(app: AppHandle, state: State<'_, SharedState>) -> Result<Vec<CoreAssetStatus>, String> {
-    let statuses = crate::core_update::list_core_statuses(&app, &state.core_paths).map_err(error_to_string)?;
+pub fn check_core_assets(state: State<'_, SharedState>) -> Result<Vec<CoreAssetStatus>, String> {
+    let statuses = crate::core_update::list_core_statuses(&state.core_paths).map_err(error_to_string)?;
     update_core_status_cache(&state, &statuses).map_err(error_to_string)?;
     Ok(statuses)
 }
 
 #[tauri::command]
 pub fn download_core_asset(
-    app: AppHandle,
     core_type: CoreType,
     state: State<'_, SharedState>,
 ) -> Result<CoreAssetStatus, String> {
-    let status = crate::core_update::download_core(&app, &state.core_paths, core_type).map_err(error_to_string)?;
+    let status = crate::core_update::download_core(&state.core_paths, core_type).map_err(error_to_string)?;
     let mut cache = load_cached_core_assets(&state).map_err(error_to_string)?;
     if let Some(existing) = cache.iter_mut().find(|asset| asset.core_type == status.core_type) {
         *existing = status.clone();
@@ -599,10 +593,10 @@ pub fn download_core_asset(
 }
 
 #[tauri::command]
-pub fn start_core(app: AppHandle, state: State<'_, SharedState>) -> Result<RunningStatus, String> {
+pub fn start_core(state: State<'_, SharedState>) -> Result<RunningStatus, String> {
     let status = state
         .runtime
-        .start(&app, &state.store, &state.core_paths)
+        .start(&state.event_sender, &state.store, &state.core_paths)
         .map_err(error_to_string)?;
 
     let config = state.store.load().map_err(error_to_string)?;
@@ -635,9 +629,9 @@ pub fn stop_core(state: State<'_, SharedState>) -> Result<RunningStatus, String>
 }
 
 #[tauri::command]
-pub fn restart_core(app: AppHandle, state: State<'_, SharedState>) -> Result<RunningStatus, String> {
+pub fn restart_core(state: State<'_, SharedState>) -> Result<RunningStatus, String> {
     let _ = stop_core(state.clone());
-    start_core(app, state)
+    start_core(state)
 }
 
 #[tauri::command]
@@ -691,10 +685,8 @@ pub fn probe_current_outbound(state: State<'_, SharedState>) -> Result<ProxyProb
     }
 }
 
-#[tauri::command]
-pub fn get_clash_proxy_groups(state: State<'_, SharedState>) -> Result<Vec<ClashProxyGroup>, String> {
-    let config = state.store.load().map_err(error_to_string)?;
-    let value = clash_api_get(&config, "/proxies").map_err(error_to_string)?;
+pub fn parse_clash_proxy_groups(config: &AppConfig) -> Result<Vec<ClashProxyGroup>, String> {
+    let value = clash_api_get(config, "/proxies").map_err(error_to_string)?;
     let mut groups = vec![];
     if let Some(proxies) = value.get("proxies").and_then(Value::as_object) {
         for (name, proxy) in proxies {
@@ -728,6 +720,12 @@ pub fn get_clash_proxy_groups(state: State<'_, SharedState>) -> Result<Vec<Clash
 }
 
 #[tauri::command]
+pub fn get_clash_proxy_groups(state: State<'_, SharedState>) -> Result<Vec<ClashProxyGroup>, String> {
+    let config = state.store.load().map_err(error_to_string)?;
+    parse_clash_proxy_groups(&config)
+}
+
+#[tauri::command]
 pub fn select_clash_proxy(group_name: String, proxy_name: String, state: State<'_, SharedState>) -> Result<(), String> {
     let config = state.store.load().map_err(error_to_string)?;
     clash_api_put(
@@ -738,10 +736,8 @@ pub fn select_clash_proxy(group_name: String, proxy_name: String, state: State<'
     .map_err(error_to_string)
 }
 
-#[tauri::command]
-pub fn get_clash_connections(state: State<'_, SharedState>) -> Result<Vec<ClashConnection>, String> {
-    let config = state.store.load().map_err(error_to_string)?;
-    let value = clash_api_get(&config, "/connections").map_err(error_to_string)?;
+pub fn parse_clash_connections(config: &AppConfig) -> Result<Vec<ClashConnection>, String> {
+    let value = clash_api_get(config, "/connections").map_err(error_to_string)?;
     let mut connections = vec![];
     for item in value
         .get("connections")
@@ -782,15 +778,19 @@ pub fn get_clash_connections(state: State<'_, SharedState>) -> Result<Vec<ClashC
 }
 
 #[tauri::command]
+pub fn get_clash_connections(state: State<'_, SharedState>) -> Result<Vec<ClashConnection>, String> {
+    let config = state.store.load().map_err(error_to_string)?;
+    parse_clash_connections(&config)
+}
+
+#[tauri::command]
 pub fn test_clash_proxy_delay(group_name: String, state: State<'_, SharedState>) -> Result<u64, String> {
     let config = state.store.load().map_err(error_to_string)?;
     clash_api_delay_test(&config, &group_name).map_err(error_to_string)
 }
 
-#[tauri::command]
-pub fn get_clash_proxy_providers(state: State<'_, SharedState>) -> Result<Vec<ClashProxyProvider>, String> {
-    let config = state.store.load().map_err(error_to_string)?;
-    let value = clash_api_get(&config, "/providers/proxies").map_err(error_to_string)?;
+pub fn parse_clash_proxy_providers(config: &AppConfig) -> Result<Vec<ClashProxyProvider>, String> {
+    let value = clash_api_get(config, "/providers/proxies").map_err(error_to_string)?;
     let mut providers = vec![];
     if let Some(items) = value.get("providers").and_then(Value::as_object) {
         for (name, provider) in items {
@@ -818,6 +818,12 @@ pub fn get_clash_proxy_providers(state: State<'_, SharedState>) -> Result<Vec<Cl
         }
     }
     Ok(providers)
+}
+
+#[tauri::command]
+pub fn get_clash_proxy_providers(state: State<'_, SharedState>) -> Result<Vec<ClashProxyProvider>, String> {
+    let config = state.store.load().map_err(error_to_string)?;
+    parse_clash_proxy_providers(&config)
 }
 
 #[tauri::command]
@@ -858,42 +864,44 @@ pub fn refresh_clash_proxy_provider(provider_name: String, state: State<'_, Shar
     .map_err(error_to_string)
 }
 
-fn clash_api_get(config: &AppConfig, path: &str) -> Result<Value> {
+// ── Clash API 辅助 ───────────────────────────────────────────────────────────
+
+pub fn clash_api_get(config: &AppConfig, path: &str) -> Result<Value> {
     let client = build_client("v2rayN-tauri", None)?;
     let url = format!("http://127.0.0.1:{}{}", config.clash.external_controller_port, path);
     let response = clash_request(client.get(url), config)?.error_for_status()?;
     Ok(response.json()?)
 }
 
-fn clash_api_put(config: &AppConfig, path: &str, body: Value) -> Result<()> {
+pub fn clash_api_put(config: &AppConfig, path: &str, body: Value) -> Result<()> {
     let client = build_client("v2rayN-tauri", None)?;
     let url = format!("http://127.0.0.1:{}{}", config.clash.external_controller_port, path);
     clash_request(client.put(url).json(&body), config)?.error_for_status()?;
     Ok(())
 }
 
-fn clash_api_put_with_query(config: &AppConfig, path: &str, body: Value) -> Result<()> {
+pub fn clash_api_put_with_query(config: &AppConfig, path: &str, body: Value) -> Result<()> {
     let client = build_client("v2rayN-tauri", None)?;
     let url = format!("http://127.0.0.1:{}{}", config.clash.external_controller_port, path);
     clash_request(client.put(url).json(&body), config)?.error_for_status()?;
     Ok(())
 }
 
-fn clash_api_patch(config: &AppConfig, path: &str, body: Value) -> Result<()> {
+pub fn clash_api_patch(config: &AppConfig, path: &str, body: Value) -> Result<()> {
     let client = build_client("v2rayN-tauri", None)?;
     let url = format!("http://127.0.0.1:{}{}", config.clash.external_controller_port, path);
     clash_request(client.patch(url).json(&body), config)?.error_for_status()?;
     Ok(())
 }
 
-fn clash_api_delete(config: &AppConfig, path: &str) -> Result<()> {
+pub fn clash_api_delete(config: &AppConfig, path: &str) -> Result<()> {
     let client = build_client("v2rayN-tauri", None)?;
     let url = format!("http://127.0.0.1:{}{}", config.clash.external_controller_port, path);
     clash_request(client.delete(url), config)?.error_for_status()?;
     Ok(())
 }
 
-fn clash_api_delay_test(config: &AppConfig, group_name: &str) -> Result<u64> {
+pub fn clash_api_delay_test(config: &AppConfig, group_name: &str) -> Result<u64> {
     let client = build_client("v2rayN-tauri", None)?;
     let url = format!(
         "http://127.0.0.1:{}/proxies/{}/delay?timeout=10000&url={}",
@@ -928,6 +936,6 @@ fn latest_delay_ms(proxy: Option<&serde_json::Map<String, Value>>) -> Option<u64
         .and_then(|history| history.iter().rev().find_map(|entry| entry.get("delay").and_then(Value::as_u64)))
 }
 
-fn error_to_string(error: impl std::fmt::Display) -> String {
+pub fn error_to_string(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
