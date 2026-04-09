@@ -14,9 +14,9 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use url::Url;
 
-const BUILTIN_ROUTE_WHITE: &str = include_str!("../../../v2rayN/ServiceLib/Sample/custom_routing_white");
-const BUILTIN_ROUTE_BLACK: &str = include_str!("../../../v2rayN/ServiceLib/Sample/custom_routing_black");
-const BUILTIN_ROUTE_GLOBAL: &str = include_str!("../../../v2rayN/ServiceLib/Sample/custom_routing_global");
+const BUILTIN_ROUTE_WHITE: &str = include_str!("../sample/custom_routing_white");
+const BUILTIN_ROUTE_BLACK: &str = include_str!("../sample/custom_routing_black");
+const BUILTIN_ROUTE_GLOBAL: &str = include_str!("../sample/custom_routing_global");
 
 #[derive(Debug, Clone)]
 pub struct ConfigArtifact {

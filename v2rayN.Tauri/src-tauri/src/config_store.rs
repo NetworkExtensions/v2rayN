@@ -3,9 +3,9 @@ use anyhow::{Context, Result};
 use std::{fs, path::{Path, PathBuf}};
 use tauri::{AppHandle, Manager};
 
-const BUILTIN_ROUTE_WHITE: &str = include_str!("../../../v2rayN/ServiceLib/Sample/custom_routing_white");
-const BUILTIN_ROUTE_BLACK: &str = include_str!("../../../v2rayN/ServiceLib/Sample/custom_routing_black");
-const BUILTIN_ROUTE_GLOBAL: &str = include_str!("../../../v2rayN/ServiceLib/Sample/custom_routing_global");
+const BUILTIN_ROUTE_WHITE: &str = include_str!("../sample/custom_routing_white");
+const BUILTIN_ROUTE_BLACK: &str = include_str!("../sample/custom_routing_black");
+const BUILTIN_ROUTE_GLOBAL: &str = include_str!("../sample/custom_routing_global");
 
 #[derive(Debug, Clone)]
 pub struct ConfigStore {
