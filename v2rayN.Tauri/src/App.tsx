@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react'
+import type { ChangeEvent, ReactNode } from 'react'
 import { useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 
 import { desktopApi } from './lib/api'
@@ -18,10 +18,27 @@ import type {
   Subscription,
 } from './lib/types'
 
-type TabKey = 'overview' | 'profiles' | 'subscriptions' | 'routing' | 'settings' | 'clash' | 'logs'
+type PrimaryTabKey = 'home' | 'import' | 'exceptions' | 'advanced'
+type AdvancedTabKey = 'profiles' | 'subscriptions' | 'routing' | 'settings' | 'clash' | 'logs'
+type QuickMode = 'rule' | 'global' | 'direct'
+type SimpleRuleKind = 'host' | 'app'
+type PriorityLevel = 'high' | 'normal'
+type SaveState = 'idle' | 'dirty' | 'saving' | 'saved' | 'error'
 
-const tabs: Array<{ key: TabKey; label: string }> = [
-  { key: 'overview', label: '总览' },
+interface SimpleRuleDraft {
+  target: string
+  action: 'proxy' | 'direct' | 'block'
+  priority: PriorityLevel
+}
+
+const primaryTabs: Array<{ key: PrimaryTabKey; label: string; description: string }> = [
+  { key: 'home', label: '首页', description: '连接状态与模式切换' },
+  { key: 'import', label: '添加配置', description: '统一导入入口' },
+  { key: 'exceptions', label: '规则与例外', description: '网站与 App 例外' },
+  { key: 'advanced', label: '高级', description: '专业模式与诊断' },
+]
+
+const advancedTabs: Array<{ key: AdvancedTabKey; label: string }> = [
   { key: 'profiles', label: '节点' },
   { key: 'subscriptions', label: '订阅' },
   { key: 'routing', label: '路由' },
@@ -31,19 +48,32 @@ const tabs: Array<{ key: TabKey; label: string }> = [
 ]
 
 function App() {
-  const [activeTab, setActiveTab] = useState<TabKey>('overview')
+  const [activeTab, setActiveTab] = useState<PrimaryTabKey>('home')
+  const [advancedTab, setAdvancedTab] = useState<AdvancedTabKey>('profiles')
   const [status, setStatus] = useState<AppStatus | null>(null)
   const [config, setConfig] = useState<AppConfig | null>(null)
   const [selectedProfileId, setSelectedProfileId] = useState<string>('')
   const [logs, setLogs] = useState<CoreLogEvent[]>([])
   const [importText, setImportText] = useState('')
+  const [quickSubscriptionUrl, setQuickSubscriptionUrl] = useState('')
+  const [quickSubscriptionName, setQuickSubscriptionName] = useState('')
   const [preview, setPreview] = useState('')
   const [busyAction, setBusyAction] = useState<string | null>(null)
   const [message, setMessage] = useState<string>('')
+  const [saveState, setSaveState] = useState<SaveState>('idle')
+  const [professionalMode, setProfessionalMode] = useState<boolean>(() => {
+    if (typeof window === 'undefined') {
+      return false
+    }
+    return window.localStorage.getItem('v2rayn-professional-mode') === 'true'
+  })
   const [probeLoading, setProbeLoading] = useState(false)
   const [previewLoading, setPreviewLoading] = useState(false)
   const [previewStale, setPreviewStale] = useState(false)
   const [lastImportPreview, setLastImportPreview] = useState<ImportPreview | null>(null)
+  const [clipboardSuggestion, setClipboardSuggestion] = useState<string>('')
+  const [hostRuleDraft, setHostRuleDraft] = useState<SimpleRuleDraft>({ target: '', action: 'proxy', priority: 'high' })
+  const [appRuleDraft, setAppRuleDraft] = useState<SimpleRuleDraft>({ target: '', action: 'direct', priority: 'normal' })
   const [clashProxyGroups, setClashProxyGroups] = useState<ClashProxyGroup[]>([])
   const [clashProxyProviders, setClashProxyProviders] = useState<ClashProxyProvider[]>([])
   const [clashConnections, setClashConnections] = useState<ClashConnection[]>([])
@@ -54,6 +84,8 @@ function App() {
   const deferredClashConnectionFilter = useDeferredValue(clashConnectionFilter)
   const logBufferRef = useRef<CoreLogEvent[]>([])
   const appStateRefreshTimerRef = useRef<number | null>(null)
+  const importFileRef = useRef<HTMLInputElement | null>(null)
+  const autosavePendingRef = useRef(false)
 
   useEffect(() => {
     void loadStatus()
@@ -100,6 +132,40 @@ function App() {
     return () => window.clearInterval(timer)
   }, [])
 
+  useEffect(() => {
+    if (!message) {
+      return
+    }
+    const timer = window.setTimeout(() => setMessage(''), 5000)
+    return () => window.clearTimeout(timer)
+  }, [message])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return
+    }
+    window.localStorage.setItem('v2rayn-professional-mode', String(professionalMode))
+  }, [professionalMode])
+
+  useEffect(() => {
+    if (typeof navigator === 'undefined' || !navigator.clipboard?.readText) {
+      return
+    }
+    let cancelled = false
+    void navigator.clipboard
+      .readText()
+      .then((text) => {
+        if (cancelled || !looksLikeImportText(text)) {
+          return
+        }
+        setClipboardSuggestion(text.trim())
+      })
+      .catch(() => {})
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
   const selectedProfile = useMemo(() => {
     return config?.profiles.find((profile) => profile.id === selectedProfileId) ?? null
   }, [config, selectedProfileId])
@@ -111,6 +177,14 @@ function App() {
   const selectedRoutingRule = useMemo(() => {
     return selectedRouting?.rule_set.find((rule) => rule.id === selectedRoutingRuleId) ?? null
   }, [selectedRouting, selectedRoutingRuleId])
+  const activeRoutingItem = useMemo(() => {
+    return (
+      config?.routing.items.find((item) => item.id === config.routing.routing_index_id) ??
+      config?.routing.items.find((item) => item.is_active) ??
+      config?.routing.items[0] ??
+      null
+    )
+  }, [config])
   const [profileDraft, setProfileDraft] = useState<Profile | null>(null)
   const [routingDraft, setRoutingDraft] = useState<RoutingItem | null>(null)
   const [routingRuleDraft, setRoutingRuleDraft] = useState<RoutingRule | null>(null)
@@ -120,6 +194,49 @@ function App() {
   const editingProfile = profileDraft ?? selectedProfile
   const editingRouting = routingDraft ?? selectedRouting
   const editingRoutingRule = routingRuleDraft ?? selectedRoutingRule
+  const installedCoreTypes = useMemo(
+    () =>
+      new Set(
+        (status?.core_assets ?? [])
+          .filter((asset) => asset.installed_version || asset.executable_path)
+          .map((asset) => asset.core_type),
+      ),
+    [status?.core_assets],
+  )
+  const recommendedCore = useMemo<CoreType>(() => {
+    const preferred = selectedProfile?.core_type
+    if (preferred && installedCoreTypes.has(preferred)) {
+      return preferred
+    }
+    if (installedCoreTypes.has('sing_box')) {
+      return 'sing_box'
+    }
+    if (installedCoreTypes.has('xray')) {
+      return 'xray'
+    }
+    if (installedCoreTypes.has('mihomo')) {
+      return 'mihomo'
+    }
+    return preferred ?? 'sing_box'
+  }, [installedCoreTypes, selectedProfile?.core_type])
+  const currentMode = (config?.routing.mode === 'global' || config?.routing.mode === 'direct' ? config.routing.mode : 'rule') as QuickMode
+  const hostRules = useMemo(
+    () =>
+      (activeRoutingItem?.rule_set ?? []).filter(
+        (rule) => rule.domain.length > 0 && rule.process.length === 0 && ['proxy', 'direct', 'block'].includes(rule.outbound_tag ?? ''),
+      ),
+    [activeRoutingItem],
+  )
+  const appRules = useMemo(
+    () =>
+      (activeRoutingItem?.rule_set ?? []).filter(
+        (rule) => rule.process.length > 0 && rule.domain.length === 0 && ['proxy', 'direct', 'block'].includes(rule.outbound_tag ?? ''),
+      ),
+    [activeRoutingItem],
+  )
+  const needsCoreSetup = useMemo(() => !installedCoreTypes.has(recommendedCore), [installedCoreTypes, recommendedCore])
+  const needsImportSetup = (config?.profiles.length ?? 0) === 0
+  const showOnboarding = needsCoreSetup || needsImportSetup
 
   const sortedClashProxyGroups = useMemo(() => {
     const groups = [...clashProxyGroups]
@@ -154,10 +271,10 @@ function App() {
   }, [deferredClashConnectionFilter, clashConnections])
 
   useEffect(() => {
-    if (activeTab === 'clash' && status?.runtime.running && status.runtime.core_type === 'mihomo') {
+    if (activeTab === 'advanced' && advancedTab === 'clash' && status?.runtime.running && status.runtime.core_type === 'mihomo') {
       void refreshClashState()
     }
-  }, [activeTab, status?.runtime.running, status?.runtime.core_type])
+  }, [activeTab, advancedTab, status?.runtime.running, status?.runtime.core_type])
 
   useEffect(() => {
     const nextRoutingId =
@@ -209,6 +326,8 @@ function App() {
         if (target) {
           Object.assign(target, profileDraft)
         }
+        autosavePendingRef.current = true
+        setSaveState('dirty')
         return nextConfig
       })
     }, 250)
@@ -230,6 +349,8 @@ function App() {
         if (target) {
           Object.assign(target, routingDraft)
         }
+        autosavePendingRef.current = true
+        setSaveState('dirty')
         return nextConfig
       })
     }, 250)
@@ -253,6 +374,8 @@ function App() {
         if (target) {
           Object.assign(target, routingRuleDraft)
         }
+        autosavePendingRef.current = true
+        setSaveState('dirty')
         return nextConfig
       })
     }, 250)
@@ -260,8 +383,22 @@ function App() {
   }, [routingRuleDraft, selectedRoutingId])
 
   useEffect(() => {
+    if (!config || !autosavePendingRef.current) {
+      return
+    }
+    const timer = window.setTimeout(() => {
+      const snapshot = buildConfigWithDrafts(config)
+      autosavePendingRef.current = false
+      setSaveState('saving')
+      void persistConfig(snapshot, { successMessage: '更改已自动保存', silent: true })
+    }, 900)
+    return () => window.clearTimeout(timer)
+  }, [config])
+
+  useEffect(() => {
     if (
-      activeTab !== 'clash' ||
+      activeTab !== 'advanced' ||
+      advancedTab !== 'clash' ||
       status?.runtime.core_type !== 'mihomo' ||
       !status?.runtime.running ||
       !config?.clash.proxies_auto_refresh
@@ -277,6 +414,7 @@ function App() {
     return () => window.clearInterval(timer)
   }, [
     activeTab,
+    advancedTab,
     status?.runtime.core_type,
     status?.runtime.running,
     config?.clash.proxies_auto_refresh,
@@ -285,7 +423,8 @@ function App() {
 
   useEffect(() => {
     if (
-      activeTab !== 'clash' ||
+      activeTab !== 'advanced' ||
+      advancedTab !== 'clash' ||
       status?.runtime.core_type !== 'mihomo' ||
       !status?.runtime.running ||
       !config?.clash.connections_auto_refresh
@@ -301,6 +440,7 @@ function App() {
     return () => window.clearInterval(timer)
   }, [
     activeTab,
+    advancedTab,
     status?.runtime.core_type,
     status?.runtime.running,
     config?.clash.connections_auto_refresh,
@@ -309,7 +449,8 @@ function App() {
 
   useEffect(() => {
     if (
-      activeTab !== 'clash' ||
+      activeTab !== 'advanced' ||
+      advancedTab !== 'clash' ||
       status?.runtime.core_type !== 'mihomo' ||
       !status?.runtime.running ||
       !config?.clash.providers_auto_refresh
@@ -323,6 +464,7 @@ function App() {
     return () => window.clearInterval(timer)
   }, [
     activeTab,
+    advancedTab,
     status?.runtime.core_type,
     status?.runtime.running,
     config?.clash.providers_auto_refresh,
@@ -336,10 +478,12 @@ function App() {
         setStatus(nextStatus)
         setConfig(nextStatus.config)
         setSelectedProfileId(nextStatus.config.selected_profile_id ?? nextStatus.config.profiles[0]?.id ?? '')
+        setSaveState('idle')
       }
     } catch (error) {
       console.error('[loadStatus] failed:', error)
       setMessage(String(error))
+      setSaveState('error')
     }
   }
 
@@ -362,6 +506,7 @@ function App() {
       setStatus(nextStatus)
       setConfig(nextStatus.config)
       setSelectedProfileId(nextStatus.config.selected_profile_id ?? nextStatus.config.profiles[0]?.id ?? '')
+      setSaveState('idle')
     }
     return nextStatus
   }
@@ -425,18 +570,33 @@ function App() {
     }
   }
 
-  async function persistConfig(nextConfig: AppConfig, successMessage?: string) {
-    setBusyAction('save')
+  async function persistConfig(
+    nextConfig: AppConfig,
+    options?: { successMessage?: string; silent?: boolean; trackBusy?: boolean },
+  ) {
+    const { successMessage, silent = false, trackBusy = false } = options ?? {}
+    if (trackBusy) {
+      setBusyAction('save')
+    }
+    setSaveState('saving')
     try {
       const saved = await desktopApi.saveConfig(nextConfig)
       setConfig(saved)
       setSelectedProfileId(saved.selected_profile_id ?? saved.profiles[0]?.id ?? '')
-      setMessage(successMessage ?? '配置已保存')
+      setSaveState('saved')
+      if (!silent) {
+        setMessage(successMessage ?? '配置已保存')
+      }
       setPreviewStale(true)
+      return saved
     } catch (error) {
+      setSaveState('error')
       setMessage(String(error))
+      return null
     } finally {
-      setBusyAction(null)
+      if (trackBusy) {
+        setBusyAction(null)
+      }
     }
   }
 
@@ -478,6 +638,8 @@ function App() {
 
     const draft: AppConfig = structuredClone(config)
     mutator(draft)
+    autosavePendingRef.current = true
+    setSaveState('dirty')
     setConfig(draft)
   }
 
@@ -546,50 +708,182 @@ function App() {
     return draft
   }
 
-  async function handleImport(coreType: CoreType) {
-    if (!importText.trim()) {
-      setMessage('请输入分享链接或订阅内容')
-      return
+  async function flushPendingConfigIfNeeded(successMessage?: string) {
+    if (!config || !autosavePendingRef.current) {
+      return config
     }
+    autosavePendingRef.current = false
+    return persistConfig(buildConfigWithDrafts(config), { successMessage, silent: !successMessage })
+  }
 
-    setBusyAction('import')
+  async function runWithFlushedConfig<T>(work: () => Promise<T>) {
+    await flushPendingConfigIfNeeded()
+    return work()
+  }
+
+  async function analyzeImportPayload(raw = importText) {
+    if (!raw.trim()) {
+      setMessage('请先粘贴分享链接、订阅内容或完整配置')
+      return null
+    }
+    setBusyAction('import-preview')
     try {
-      const nextConfig = await desktopApi.importShareLinks(importText, coreType)
-      setConfig(nextConfig)
-      setSelectedProfileId(nextConfig.selected_profile_id ?? nextConfig.profiles[0]?.id ?? '')
-      setImportText('')
-      setLastImportPreview(null)
-      setMessage('导入成功')
-      setPreviewStale(true)
+      const previewResult = await desktopApi.previewImport(raw, 'sing_box')
+      setLastImportPreview(previewResult)
+      return previewResult
     } catch (error) {
       setMessage(String(error))
+      return null
     } finally {
       setBusyAction(null)
     }
   }
 
-  async function handleImportFullConfig() {
-    if (!importText.trim()) {
-      setMessage('请输入完整配置内容')
+  async function handleSmartImport(raw = importText) {
+    if (!raw.trim()) {
+      setMessage('请先粘贴分享链接、订阅内容或完整配置')
+      return
+    }
+    if (isHttpUrl(raw)) {
+      setQuickSubscriptionUrl(raw.trim())
+      setMessage('这是一个网址，请使用右侧“网址获取”来添加并拉取')
       return
     }
 
-    setBusyAction('import-full')
+    setBusyAction('smart-import')
     try {
-      const previewResult = await desktopApi.previewImport(importText, 'sing_box')
+      const previewResult = await desktopApi.previewImport(raw, 'sing_box')
       setLastImportPreview(previewResult)
-      if (!previewResult.stores_as_external) {
-        setMessage(previewResult.message ?? '当前内容更适合用分享链接导入')
+      if (previewResult.format === 'unknown') {
+        setMessage(previewResult.message ?? '无法识别导入内容')
         return
       }
-      const nextConfig = await desktopApi.importFullConfig(importText)
+
+      const nextConfig = previewResult.stores_as_external
+        ? await desktopApi.importFullConfig(raw)
+        : await desktopApi.importShareLinks(raw, recommendedCore)
+
       setConfig(nextConfig)
       setSelectedProfileId(nextConfig.selected_profile_id ?? nextConfig.profiles[0]?.id ?? '')
       setImportText('')
-      setMessage(previewResult.message ?? '完整配置导入成功')
+      setClipboardSuggestion('')
+      setActiveTab('home')
+      setSaveState('idle')
+      setMessage(
+        previewResult.stores_as_external
+          ? previewResult.message ?? '完整配置已导入，现在可以直接连接'
+          : `已导入 ${previewResult.profile_count || nextConfig.profiles.length} 个配置，已为你推荐 ${formatCoreType(recommendedCore)} 内核`,
+      )
       setPreviewStale(true)
     } catch (error) {
       setMessage(String(error))
+      setSaveState('error')
+    } finally {
+      setBusyAction(null)
+    }
+  }
+
+  async function handleImportFileChange(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0]
+    if (!file) {
+      return
+    }
+    try {
+      const text = await file.text()
+      setImportText(text)
+      setMessage(`已载入本地文件：${file.name}`)
+      void analyzeImportPayload(text)
+    } catch (error) {
+      setMessage(`读取文件失败：${error}`)
+    } finally {
+      event.target.value = ''
+    }
+  }
+
+  async function handleReadClipboard() {
+    if (typeof navigator === 'undefined' || !navigator.clipboard?.readText) {
+      setMessage('当前环境不支持读取剪贴板')
+      return
+    }
+    try {
+      const text = await navigator.clipboard.readText()
+      if (!looksLikeImportText(text)) {
+        setMessage('剪贴板中没有发现可识别的配置内容')
+        return
+      }
+      if (isHttpUrl(text)) {
+        setQuickSubscriptionUrl(text.trim())
+        setClipboardSuggestion(text.trim())
+        setMessage('已读取订阅网址，请确认后点击“添加并立即拉取”')
+        return
+      }
+      setImportText(text.trim())
+      setClipboardSuggestion(text.trim())
+      setMessage('已读取剪贴板内容')
+      void analyzeImportPayload(text)
+    } catch (error) {
+      setMessage(`读取剪贴板失败：${error}`)
+    }
+  }
+
+  async function handleQuickSubscriptionImport() {
+    if (!quickSubscriptionUrl.trim()) {
+      setMessage('请输入订阅地址')
+      return
+    }
+    let name = quickSubscriptionName.trim()
+    try {
+      if (!name) {
+        const parsed = new URL(quickSubscriptionUrl)
+        name = parsed.hostname || `订阅 ${(config?.subscriptions.length ?? 0) + 1}`
+      }
+    } catch {
+      setMessage('订阅地址格式不正确')
+      return
+    }
+
+    setBusyAction('subscription-quick')
+    try {
+      const draft: Subscription = {
+        id: crypto.randomUUID(),
+        name,
+        url: quickSubscriptionUrl.trim(),
+        enabled: true,
+        more_urls: [],
+        user_agent: 'v2rayN-tauri',
+        filter: '',
+        auto_update_interval_secs: null,
+        convert_core_target: recommendedCore,
+        use_proxy_on_refresh: true,
+        last_checked_at: null,
+        last_synced_at: null,
+        last_error: null,
+      }
+      const savedConfig = await desktopApi.saveSubscription(draft)
+      const refreshedConfig = await desktopApi.refreshSubscription(draft.id, recommendedCore)
+      setConfig(refreshedConfig)
+      setSelectedProfileId(refreshedConfig.selected_profile_id ?? refreshedConfig.profiles[0]?.id ?? '')
+      setQuickSubscriptionUrl('')
+      setQuickSubscriptionName('')
+      setLastImportPreview({
+        format: 'share_links',
+        profile_names: refreshedConfig.profiles
+          .filter((profile) => profile.source_subscription_id === draft.id)
+          .map((profile) => profile.name),
+        profile_count: refreshedConfig.profiles.filter((profile) => profile.source_subscription_id === draft.id).length,
+        stores_as_external: false,
+        external_format: null,
+        message: `订阅已添加，并按 ${formatCoreType(recommendedCore)} 完成转换`,
+      })
+      setActiveTab('home')
+      setSaveState('idle')
+      setPreviewStale(true)
+      setMessage(`订阅已添加并完成拉取，共导入 ${refreshedConfig.profiles.filter((profile) => profile.source_subscription_id === draft.id).length} 个节点`)
+      setStatus((current) => (current ? { ...current, config: refreshedConfig } : current))
+      void savedConfig
+    } catch (error) {
+      setMessage(String(error))
+      setSaveState('error')
     } finally {
       setBusyAction(null)
     }
@@ -600,6 +894,7 @@ function App() {
     try {
       const nextConfig = await desktopApi.saveSubscription(subscription)
       setConfig(nextConfig)
+      setSaveState('idle')
       setMessage('订阅已保存')
     } catch (error) {
       setMessage(String(error))
@@ -611,8 +906,10 @@ function App() {
   async function handleRefreshSubscription(subscriptionId: string, coreType: CoreType) {
     setBusyAction(`subscription-refresh-${subscriptionId}`)
     try {
+      await flushPendingConfigIfNeeded()
       const nextConfig = await desktopApi.refreshSubscription(subscriptionId, coreType)
       setConfig(nextConfig)
+      setSaveState('idle')
       setMessage('订阅刷新完成')
       setPreviewStale(true)
     } catch (error) {
@@ -636,19 +933,34 @@ function App() {
             }
           : current,
       )
-      setMessage(`${coreType} 下载完成`)
+      setMessage(`${formatCoreType(coreType)} 下载完成`)
+      return updatedAsset
     } catch (error) {
       setMessage(String(error))
+      return null
     } finally {
       setBusyAction(null)
     }
   }
 
   async function handleStart() {
+    if (!selectedProfile && (config?.profiles.length ?? 0) === 0) {
+      setActiveTab('import')
+      setMessage('先添加一个配置，再点击连接')
+      return
+    }
     const validationError = validateSelectedProfile(selectedProfile)
     if (validationError) {
       setMessage(validationError)
       return
+    }
+    await flushPendingConfigIfNeeded()
+    if (selectedProfile && !installedCoreTypes.has(selectedProfile.core_type)) {
+      const downloaded = await handleCoreDownload(selectedProfile.core_type)
+      if (!downloaded) {
+        setMessage(`未能自动准备 ${formatCoreType(selectedProfile.core_type)}，请稍后重试`)
+        return
+      }
     }
     setBusyAction('start')
     try {
@@ -712,6 +1024,14 @@ function App() {
       setMessage(validationError)
       return
     }
+    await flushPendingConfigIfNeeded()
+    if (selectedProfile && !installedCoreTypes.has(selectedProfile.core_type)) {
+      const downloaded = await handleCoreDownload(selectedProfile.core_type)
+      if (!downloaded) {
+        setMessage(`未能自动准备 ${formatCoreType(selectedProfile.core_type)}，请稍后重试`)
+        return
+      }
+    }
     setBusyAction('restart')
     try {
       await desktopApi.restartCore()
@@ -750,6 +1070,7 @@ function App() {
         ? await desktopApi.enableSystemProxy()
         : await desktopApi.disableSystemProxy()
       setConfig(nextConfig)
+      setSaveState('idle')
       await syncRuntimeStatus()
       setMessage(enabled ? '系统代理已开启' : '系统代理已关闭')
     } catch (error) {
@@ -757,6 +1078,87 @@ function App() {
     } finally {
       setBusyAction(null)
     }
+  }
+
+  async function handleQuickModeChange(mode: QuickMode) {
+    updateConfig((draft) => {
+      draft.routing.mode = mode
+      if (draft.clash.rule_mode !== 'unchanged') {
+        draft.clash.rule_mode = mode
+      }
+    })
+
+    if (status?.runtime.running && status.runtime.core_type === 'mihomo') {
+      setBusyAction('quick-mode')
+      try {
+        await desktopApi.updateClashRuleMode(mode)
+        await refreshClashState()
+      } catch (error) {
+        setMessage(`运行中的 Clash 模式切换失败：${error}`)
+      } finally {
+        setBusyAction(null)
+      }
+    }
+  }
+
+  function addSimpleRule(kind: SimpleRuleKind) {
+    const draft = kind === 'host' ? hostRuleDraft : appRuleDraft
+    if (!draft.target.trim()) {
+      setMessage(kind === 'host' ? '请填写网站或 host' : '请填写 App 名称或进程名')
+      return
+    }
+    if (!activeRoutingItem) {
+      setMessage('当前没有可用的路由集，请先在高级中初始化路由')
+      return
+    }
+
+    updateConfig((nextConfig) => {
+      const routing = nextConfig.routing.items.find((item) => item.id === activeRoutingItem.id)
+      if (!routing) {
+        return
+      }
+      const rule: RoutingRule = {
+        id: crypto.randomUUID(),
+        rule_type: 'all',
+        enabled: true,
+        remarks: kind === 'host' ? `网站例外 · ${draft.target.trim()}` : `App 例外 · ${draft.target.trim()}`,
+        type_name: '',
+        port: '',
+        network: '',
+        inbound_tag: [],
+        outbound_tag: draft.action,
+        ip: [],
+        domain: kind === 'host' ? [draft.target.trim()] : [],
+        protocol: [],
+        process: kind === 'app' ? [draft.target.trim()] : [],
+      }
+      if (draft.priority === 'high') {
+        routing.rule_set.unshift(rule)
+      } else {
+        routing.rule_set.push(rule)
+      }
+      routing.rule_num = routing.rule_set.length
+    })
+
+    if (kind === 'host') {
+      setHostRuleDraft({ target: '', action: 'proxy', priority: 'high' })
+    } else {
+      setAppRuleDraft({ target: '', action: 'direct', priority: 'normal' })
+    }
+  }
+
+  function removeSimpleRule(ruleId: string) {
+    if (!activeRoutingItem) {
+      return
+    }
+    updateConfig((draft) => {
+      const routing = draft.routing.items.find((item) => item.id === activeRoutingItem.id)
+      if (!routing) {
+        return
+      }
+      routing.rule_set = routing.rule_set.filter((rule) => rule.id !== ruleId)
+      routing.rule_num = routing.rule_set.length
+    })
   }
 
   async function handleClashProxySelect(groupName: string, proxyName: string) {
@@ -830,8 +1232,10 @@ function App() {
   async function handleInitializeBuiltinRouting(advancedOnly = false) {
     setBusyAction('routing-init')
     try {
+      await flushPendingConfigIfNeeded()
       const nextConfig = await desktopApi.initializeBuiltinRouting(advancedOnly)
       setConfig(nextConfig)
+      setSaveState('idle')
       setMessage(advancedOnly ? '已追加内置高级路由模板' : '已初始化内置路由模板')
       setPreviewStale(true)
     } catch (error) {
@@ -848,8 +1252,10 @@ function App() {
     }
     setBusyAction('routing-template-url')
     try {
+      await flushPendingConfigIfNeeded()
       const nextConfig = await desktopApi.importRoutingTemplateUrl(routingTemplateUrlDraft.trim(), true)
       setConfig(nextConfig)
+      setSaveState('idle')
       setMessage('路由模板已导入')
       setPreviewStale(true)
     } catch (error) {
@@ -994,17 +1400,45 @@ function App() {
     })
   }
 
+  const currentTitle =
+    activeTab === 'advanced'
+      ? `高级 · ${advancedTabs.find((tab) => tab.key === advancedTab)?.label ?? '专业模式'}`
+      : primaryTabs.find((tab) => tab.key === activeTab)?.label ?? '首页'
+  const currentDescription =
+    activeTab === 'advanced'
+      ? professionalMode
+        ? '保留全部极客能力，但默认不打扰普通用户。'
+        : '需要时再开启专业模式，日常使用优先走普通路径。'
+      : primaryTabs.find((tab) => tab.key === activeTab)?.description ?? ''
+  const autoSaveLabel =
+    saveState === 'saving'
+      ? '自动保存中'
+      : saveState === 'saved'
+        ? '已自动保存'
+        : saveState === 'dirty'
+          ? '待自动保存'
+          : saveState === 'error'
+            ? '保存失败'
+            : '自动保存'
+
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100">
+      <input
+        ref={importFileRef}
+        type="file"
+        className="hidden"
+        accept=".txt,.json,.yaml,.yml,.conf,.cfg"
+        onChange={(event) => void handleImportFileChange(event)}
+      />
       <div className="mx-auto flex min-h-screen max-w-[1600px]">
         <aside className="w-60 border-r border-slate-800 bg-slate-900/80 p-5">
           <div className="mb-8">
             <p className="text-xs uppercase tracking-[0.3em] text-violet-300">v2rayN</p>
-            <h1 className="mt-3 text-2xl font-semibold">Tauri 重构版</h1>
-            <p className="mt-2 text-sm text-slate-400">Rust 负责运行时，React 负责交互与可视化。</p>
+            <h1 className="mt-3 text-2xl font-semibold">轻量交互版</h1>
+            <p className="mt-2 text-sm text-slate-400">先让普通用户顺利连上网，再把高级能力收进专业模式。</p>
           </div>
           <nav className="space-y-2">
-            {tabs.map((tab) => (
+            {primaryTabs.map((tab) => (
               <button
                 key={tab.key}
                 className={`w-full rounded-xl px-3 py-2 text-left text-sm transition ${
@@ -1014,10 +1448,28 @@ function App() {
                 }`}
                 onClick={() => setActiveTab(tab.key)}
               >
-                {tab.label}
+                <div className="font-medium">{tab.label}</div>
+                <div className="mt-1 text-xs text-slate-500">{tab.description}</div>
               </button>
             ))}
           </nav>
+          <div className="mt-6 rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <p className="text-sm font-medium text-slate-100">专业模式</p>
+                <p className="mt-1 text-xs text-slate-400">显示协议、路由、Clash 与诊断能力</p>
+              </div>
+              <button
+                className={`rounded-full px-3 py-1 text-xs font-medium ${professionalMode ? 'bg-violet-500 text-white' : 'bg-slate-800 text-slate-300'}`}
+                onClick={() => {
+                  setProfessionalMode((current) => !current)
+                  setActiveTab('advanced')
+                }}
+              >
+                {professionalMode ? '已开启' : '未开启'}
+              </button>
+            </div>
+          </div>
           <div className="mt-8 rounded-2xl border border-slate-800 bg-slate-950/70 p-4 text-xs text-slate-400">
             <p>数据目录</p>
             <p className="mt-2 break-all font-mono text-[11px] text-slate-300">{status.paths.root}</p>
@@ -1027,30 +1479,32 @@ function App() {
         <main className="flex-1 overflow-auto p-6">
           <header className="mb-6 flex flex-wrap items-center justify-between gap-4 rounded-3xl border border-slate-800 bg-slate-900/70 px-5 py-4">
             <div>
-              <h2 className="text-xl font-semibold">{tabs.find((tab) => tab.key === activeTab)?.label}</h2>
+              <h2 className="text-xl font-semibold">{currentTitle}</h2>
               <p className="mt-1 text-sm text-slate-400">
-                当前节点：{selectedProfile?.name ?? '未选择'} · 运行状态：
+                {currentDescription} 当前配置：{selectedProfile?.name ?? '未选择'} · 运行状态：
                 <span className={status.runtime.running ? 'text-emerald-300' : 'text-slate-300'}>
                   {status.runtime.running ? ' 已启动' : ' 未启动'}
                 </span>
               </p>
             </div>
             <div className="flex flex-wrap gap-3">
+              <span className={`inline-flex items-center rounded-xl px-3 py-2 text-sm ${
+                saveState === 'error'
+                  ? 'bg-rose-500/10 text-rose-200'
+                  : saveState === 'saved'
+                    ? 'bg-emerald-500/10 text-emerald-200'
+                    : 'bg-slate-800 text-slate-300'
+              }`}>
+                {autoSaveLabel}
+              </span>
               <button className="rounded-xl bg-violet-500 px-4 py-2 text-sm font-medium text-white disabled:cursor-not-allowed disabled:bg-slate-700" onClick={handleStart} disabled={busyAction !== null}>
-                {busyAction === 'start' ? '启动中...' : '启动核心'}
+                {busyAction === 'start' ? '连接中...' : status.runtime.running ? '重新连接' : '立即连接'}
               </button>
               <button className="rounded-xl border border-slate-700 px-4 py-2 text-sm text-slate-200 disabled:cursor-not-allowed disabled:text-slate-500" onClick={handleStop} disabled={busyAction !== null}>
-                {busyAction === 'stop' ? '停止中...' : '停止核心'}
+                {busyAction === 'stop' ? '停止中...' : '停止'}
               </button>
               <button className="rounded-xl border border-slate-700 px-4 py-2 text-sm text-slate-200 disabled:cursor-not-allowed disabled:text-slate-500" onClick={handleRestart} disabled={busyAction !== null}>
                 {busyAction === 'restart' ? '重启中...' : '重启核心'}
-              </button>
-              <button
-                className="rounded-xl border border-slate-700 px-4 py-2 text-sm text-slate-200 disabled:cursor-not-allowed disabled:text-slate-500"
-                onClick={() => void persistConfig(buildConfigWithDrafts(config), '配置已保存')}
-                disabled={busyAction !== null}
-              >
-                保存配置
               </button>
             </div>
           </header>
@@ -1061,100 +1515,449 @@ function App() {
             </div>
           ) : null}
 
-          {activeTab === 'overview' ? (
-            <div className="grid gap-5 lg:grid-cols-[1.35fr_1fr]">
-              <SectionCard title="核心安装状态">
-                <div className="grid gap-4 md:grid-cols-2">
-                  {status.core_assets.map((asset) => (
-                    <CoreCard
-                      key={asset.core_type}
-                      asset={asset}
-                      busy={busyAction === `download-${asset.core_type}`}
-                      onDownload={() => void handleCoreDownload(asset.core_type)}
+          {activeTab === 'home' ? (
+            <div className="grid gap-5 xl:grid-cols-[1.15fr_0.85fr]">
+              <div className="space-y-5">
+                {showOnboarding ? (
+                  <SectionCard title="首次使用向导">
+                    <div className="grid gap-4 md:grid-cols-3">
+                      <QuickStepCard
+                        index={1}
+                        title="准备内核"
+                        done={!needsCoreSetup}
+                        description={needsCoreSetup ? `推荐先安装 ${formatCoreType(recommendedCore)}，这样导入后可以直接连接。` : '已检测到可用内核。'}
+                        action={
+                          needsCoreSetup ? (
+                            <ActionButton busy={busyAction === `download-${recommendedCore}`} onClick={() => void handleCoreDownload(recommendedCore)}>
+                              安装推荐内核
+                            </ActionButton>
+                          ) : undefined
+                        }
+                      />
+                      <QuickStepCard
+                        index={2}
+                        title="添加配置"
+                        done={!needsImportSetup}
+                        description={needsImportSetup ? '支持本地文件、订阅地址和分享链接，系统会自动识别。' : `当前已有 ${config.profiles.length} 个配置可用。`}
+                        action={
+                          needsImportSetup ? (
+                            <button className="rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200" onClick={() => setActiveTab('import')}>
+                              去添加配置
+                            </button>
+                          ) : undefined
+                        }
+                      />
+                      <QuickStepCard
+                        index={3}
+                        title="一键连接"
+                        done={status.runtime.running}
+                        description={status.runtime.running ? '当前代理已运行，可以开始使用。' : '准备好后点击右上角“立即连接”即可。'}
+                      />
+                    </div>
+                  </SectionCard>
+                ) : null}
+
+                <SectionCard
+                  title="当前连接"
+                  action={
+                    !selectedProfile ? (
+                      <button className="rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200" onClick={() => setActiveTab('import')}>
+                        添加配置
+                      </button>
+                    ) : null
+                  }
+                >
+                  <div className="grid gap-4 md:grid-cols-[1fr_auto]">
+                    <div className="space-y-4">
+                      <Field label="当前使用的配置">
+                        <select
+                          value={selectedProfileId}
+                          onChange={(event) => {
+                            const nextId = event.target.value
+                            setSelectedProfileId(nextId)
+                            updateConfig((draft) => {
+                              draft.selected_profile_id = nextId
+                            })
+                          }}
+                        >
+                          <option value="">请选择一个配置</option>
+                          {config.profiles.map((profile) => (
+                            <option key={profile.id} value={profile.id}>
+                              {profile.name} · {profile.config_type === 'external' ? '外部配置' : profile.protocol}
+                            </option>
+                          ))}
+                        </select>
+                      </Field>
+                      {selectedProfile ? (
+                        <div className="grid gap-3 rounded-2xl border border-slate-800 bg-slate-950/70 p-4 md:grid-cols-3">
+                          <KeyValue label="连接目标" value={selectedProfile.config_type === 'external' ? selectedProfile.external_config_path ?? '外部配置' : `${selectedProfile.server}:${selectedProfile.port}`} mono={selectedProfile.config_type === 'external'} />
+                          <KeyValue label="推荐内核" value={formatCoreType(selectedProfile.core_type)} />
+                          <KeyValue label="配置类型" value={selectedProfile.config_type === 'external' ? '完整外部配置' : '标准节点'} />
+                        </div>
+                      ) : (
+                        <EmptyState
+                          title="还没有可连接的配置"
+                          description="普通用户只需要去“添加配置”，粘贴链接或导入文件即可。"
+                          action={<button className="rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200" onClick={() => setActiveTab('import')}>去添加配置</button>}
+                        />
+                      )}
+                    </div>
+                    <div className="grid gap-3 self-start">
+                      <StatusPill label={status.runtime.running ? '已连接' : '未连接'} tone={status.runtime.running ? 'success' : 'muted'} />
+                      <StatusPill label={config.proxy.use_system_proxy ? '系统代理已开启' : '系统代理未开启'} tone={config.proxy.use_system_proxy ? 'success' : 'muted'} />
+                      <StatusPill label={config.tun.enabled ? 'TUN 已开启' : 'TUN 未开启'} tone={config.tun.enabled ? 'success' : 'muted'} />
+                    </div>
+                  </div>
+                </SectionCard>
+
+                <SectionCard title="上网模式">
+                  <p className="mb-4 text-sm text-slate-400">普通用户日常只需要在这里切换，不必再去设置或 Clash 页面理解底层术语。</p>
+                  <div className="grid gap-3 md:grid-cols-3">
+                    <ModeOptionCard
+                      active={currentMode === 'rule'}
+                      title="智能分流"
+                      description="推荐默认模式。常见网站自动判断，需要例外时去下一页单独设置。"
+                      onClick={() => void handleQuickModeChange('rule')}
                     />
-                  ))}
-                </div>
-              </SectionCard>
-
-              <SectionCard title="运行时概览">
-                <div className="space-y-3 text-sm text-slate-300">
-                  <KeyValue label="核心类型" value={status.runtime.core_type ?? '未启动'} />
-                  <KeyValue label="配置文件" value={status.runtime.config_path ?? '-'} mono />
-                  <KeyValue label="执行文件" value={status.runtime.executable_path ?? '-'} mono />
-                  <KeyValue label="主进程 PID" value={status.runtime.pid ? String(status.runtime.pid) : '-'} />
-                  <KeyValue label="提权启动" value={status.runtime.elevated ? '是' : '否'} />
-                  <KeyValue label="辅助核心" value={status.runtime.helper_core_type ?? '-'} />
-                  <KeyValue label="辅助配置" value={status.runtime.helper_config_path ?? '-'} mono />
-                  <KeyValue label="辅助 PID" value={status.runtime.helper_pid ? String(status.runtime.helper_pid) : '-'} />
-                  <KeyValue label="系统代理" value={config.proxy.use_system_proxy ? '已开启' : '未开启'} />
-                  <KeyValue label="TUN 模式" value={config.tun.enabled ? '已开启' : '未开启'} />
-                </div>
-              </SectionCard>
-
-              <SectionCard
-                title="出口探测"
-                action={
-                  <ActionButton busy={probeLoading} onClick={() => void refreshProbe()}>
-                    刷新出口
-                  </ActionButton>
-                }
-              >
-                <div className="space-y-3 text-sm text-slate-300">
-                  <KeyValue label="出口 IP" value={status.proxy_probe?.outbound_ip ?? '-'} />
-                  <KeyValue label="国家" value={status.proxy_probe?.country ?? '-'} />
-                  <KeyValue label="城市" value={status.proxy_probe?.city ?? '-'} />
-                  <KeyValue label="运营商" value={status.proxy_probe?.isp ?? '-'} />
-                </div>
-              </SectionCard>
-
-              <SectionCard
-                title="配置预览"
-                action={
-                  <ActionButton busy={previewLoading} onClick={() => void refreshPreview()}>
-                    刷新预览
-                  </ActionButton>
-                }
-              >
-                {previewStale ? (
-                  <div className="mb-3 rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
-                    当前预览可能已过期，保存配置或点击“刷新预览”后可查看最新生成结果。
+                    <ModeOptionCard
+                      active={currentMode === 'global'}
+                      title="全局代理"
+                      description="全部流量优先走代理，适合临时排障或懒得区分场景。"
+                      onClick={() => void handleQuickModeChange('global')}
+                    />
+                    <ModeOptionCard
+                      active={currentMode === 'direct'}
+                      title="直接连接"
+                      description="全部流量直连，适合临时关闭代理或排查本地网络问题。"
+                      onClick={() => void handleQuickModeChange('direct')}
+                    />
                   </div>
-                ) : null}
-                <pre className="max-h-[34rem] overflow-auto rounded-2xl bg-slate-950 p-4 text-xs text-slate-200">
-                  {preview}
-                </pre>
-              </SectionCard>
-
-              <SectionCard title="快速导入">
-                <textarea
-                  value={importText}
-                  onChange={(event) => setImportText(event.target.value)}
-                  className="h-60 w-full rounded-2xl border border-slate-700 bg-slate-950 px-4 py-3 text-sm outline-none"
-                  placeholder="粘贴分享链接、sing-box/Xray JSON 或 Clash YAML"
-                />
-                <div className="mt-4 flex flex-wrap gap-3">
-                  <ActionButton busy={busyAction === 'import'} onClick={() => void handleImport('sing_box')}>
-                    导入为 sing-box 节点
-                  </ActionButton>
-                  <ActionButton busy={busyAction === 'import'} onClick={() => void handleImport('xray')}>
-                    导入为 Xray 节点
-                  </ActionButton>
-                  <ActionButton busy={busyAction === 'import-full'} onClick={() => void handleImportFullConfig()}>
-                    自动识别完整配置
-                  </ActionButton>
-                </div>
-                {lastImportPreview ? (
-                  <div className="mt-4 rounded-2xl border border-slate-800 bg-slate-950/70 p-4 text-sm text-slate-300">
-                    <p>最近识别：{lastImportPreview.format}</p>
-                    <p className="mt-1">结果：{lastImportPreview.message ?? '-'}</p>
-                    <p className="mt-1">预览项：{lastImportPreview.profile_names.join(', ') || '无'}</p>
+                  <div className="mt-4 flex flex-wrap gap-3">
+                    <button className="rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200" onClick={() => void handleSystemProxy(true)}>
+                      开启系统代理
+                    </button>
+                    <button className="rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200" onClick={() => void handleSystemProxy(false)}>
+                      关闭系统代理
+                    </button>
+                    <button
+                      className="rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200"
+                      onClick={() =>
+                        updateConfig((draft) => {
+                          draft.tun.enabled = !draft.tun.enabled
+                        })
+                      }
+                    >
+                      {config.tun.enabled ? '关闭 TUN' : '开启 TUN'}
+                    </button>
                   </div>
-                ) : null}
-              </SectionCard>
+                </SectionCard>
+
+                <SectionCard
+                  title="网站与 App 例外"
+                  action={
+                    <button className="rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200" onClick={() => setActiveTab('exceptions')}>
+                      去管理例外
+                    </button>
+                  }
+                >
+                  <div className="grid gap-4 md:grid-cols-2">
+                    <SummaryStat title="网站例外" value={`${hostRules.length} 条`} description={hostRules[0]?.domain[0] ?? '尚未添加'} />
+                    <SummaryStat title="App 例外" value={`${appRules.length} 条`} description={appRules[0]?.process[0] ?? '尚未添加'} />
+                  </div>
+                </SectionCard>
+              </div>
+
+              <div className="space-y-5">
+                <SectionCard title="核心准备">
+                  <div className="grid gap-4">
+                    {status.core_assets.map((asset) => (
+                      <CoreCard
+                        key={asset.core_type}
+                        asset={asset}
+                        busy={busyAction === `download-${asset.core_type}`}
+                        recommended={asset.core_type === recommendedCore}
+                        onDownload={() => void handleCoreDownload(asset.core_type)}
+                      />
+                    ))}
+                  </div>
+                </SectionCard>
+
+                <SectionCard
+                  title="出口探测"
+                  action={
+                    <ActionButton busy={probeLoading} onClick={() => void refreshProbe()}>
+                      刷新出口
+                    </ActionButton>
+                  }
+                >
+                  <div className="space-y-3 text-sm text-slate-300">
+                    <KeyValue label="出口 IP" value={status.proxy_probe?.outbound_ip ?? '-'} />
+                    <KeyValue label="国家" value={status.proxy_probe?.country ?? '-'} />
+                    <KeyValue label="城市" value={status.proxy_probe?.city ?? '-'} />
+                    <KeyValue label="运营商" value={status.proxy_probe?.isp ?? '-'} />
+                  </div>
+                </SectionCard>
+
+                <SectionCard title="运行时概览">
+                  <div className="space-y-3 text-sm text-slate-300">
+                    <KeyValue label="运行内核" value={status.runtime.core_type ? formatCoreType(status.runtime.core_type) : '未启动'} />
+                    <KeyValue label="配置文件" value={status.runtime.config_path ?? '-'} mono />
+                    <KeyValue label="执行文件" value={status.runtime.executable_path ?? '-'} mono />
+                    <KeyValue label="主进程 PID" value={status.runtime.pid ? String(status.runtime.pid) : '-'} />
+                    <KeyValue label="提权启动" value={status.runtime.elevated ? '是' : '否'} />
+                  </div>
+                </SectionCard>
+              </div>
             </div>
           ) : null}
 
-          {activeTab === 'profiles' ? (
+          {activeTab === 'import' ? (
+            <div className="grid gap-5 xl:grid-cols-[1.15fr_0.85fr]">
+              <SectionCard title="统一导入中心">
+                <p className="mb-4 text-sm text-slate-400">把本地文件、订阅内容、分享链接和完整配置统一收敛到一个入口，系统会尽量自动识别，不再让用户自己理解 sing-box / Xray 差异。</p>
+                <textarea
+                  value={importText}
+                  onChange={(event) => setImportText(event.target.value)}
+                  className="h-72 w-full rounded-2xl border border-slate-700 bg-slate-950 px-4 py-3 text-sm outline-none"
+                  placeholder="粘贴 vless://、vmess://、trojan://、订阅内容、JSON 或 Clash YAML"
+                />
+                <div className="mt-4 flex flex-wrap gap-3">
+                  <ActionButton busy={busyAction === 'smart-import'} onClick={() => void handleSmartImport()}>
+                    自动导入并推荐内核
+                  </ActionButton>
+                  <ActionButton busy={busyAction === 'import-preview'} onClick={() => void analyzeImportPayload()}>
+                    识别内容
+                  </ActionButton>
+                  <button className="rounded-xl border border-slate-700 px-4 py-2 text-sm text-slate-200" onClick={() => importFileRef.current?.click()}>
+                    从本地文件添加
+                  </button>
+                  <button className="rounded-xl border border-slate-700 px-4 py-2 text-sm text-slate-200" onClick={() => void handleReadClipboard()}>
+                    读取剪贴板
+                  </button>
+                </div>
+                {clipboardSuggestion ? (
+                  <div className="mt-4 rounded-2xl border border-emerald-500/30 bg-emerald-500/10 p-4 text-sm text-emerald-100">
+                    <p>检测到剪贴板里可能有可导入的配置内容。</p>
+                    <div className="mt-3 flex flex-wrap gap-3">
+                      <button className="rounded-xl border border-emerald-400/40 px-3 py-2 text-sm text-emerald-100" onClick={() => {
+                        if (isHttpUrl(clipboardSuggestion)) {
+                          setQuickSubscriptionUrl(clipboardSuggestion)
+                          setActiveTab('import')
+                          setMessage('检测到网址，已填入“网址获取”区域')
+                          return
+                        }
+                        setImportText(clipboardSuggestion)
+                        void handleSmartImport(clipboardSuggestion)
+                      }}>
+                        直接导入剪贴板
+                      </button>
+                      <button className="rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200" onClick={() => setImportText(clipboardSuggestion)}>
+                        仅填入编辑框
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
+                {lastImportPreview ? (
+                  <div className="mt-4 rounded-2xl border border-slate-800 bg-slate-950/70 p-4 text-sm text-slate-300">
+                    <div className="grid gap-3 md:grid-cols-3">
+                      <KeyValue label="识别结果" value={formatImportFormat(lastImportPreview.format)} />
+                      <KeyValue label="配置数量" value={String(lastImportPreview.profile_count)} />
+                      <KeyValue label="导入方式" value={lastImportPreview.stores_as_external ? '完整外部配置' : `标准节点 · ${formatCoreType(recommendedCore)}`} />
+                    </div>
+                    <p className="mt-3 text-slate-300">{lastImportPreview.message ?? '已完成识别。'}</p>
+                    <p className="mt-2 text-xs text-slate-500">{lastImportPreview.profile_names.join('、') || '当前没有可预览的节点名称。'}</p>
+                  </div>
+                ) : null}
+              </SectionCard>
+
+              <div className="space-y-5">
+                <SectionCard title="网址获取">
+                  <div className="grid gap-4">
+                    <Field label="订阅地址">
+                      <input value={quickSubscriptionUrl} onChange={(event) => setQuickSubscriptionUrl(event.target.value)} placeholder="https://example.com/sub.txt" />
+                    </Field>
+                    <Field label="显示名称（可选）">
+                      <input value={quickSubscriptionName} onChange={(event) => setQuickSubscriptionName(event.target.value)} placeholder="留空则自动使用域名" />
+                    </Field>
+                    <ActionButton busy={busyAction === 'subscription-quick'} onClick={() => void handleQuickSubscriptionImport()}>
+                      添加并立即拉取
+                    </ActionButton>
+                  </div>
+                </SectionCard>
+
+                <SectionCard title="给普通用户的建议">
+                  <div className="space-y-3 text-sm text-slate-300">
+                    <p>推荐优先级：订阅地址 &gt; 分享链接 &gt; 完整配置文件。</p>
+                    <p>如果你只拿到一串 `vless://...` 或 `vmess://...`，直接粘贴到左侧然后点“自动导入”即可。</p>
+                    <p>如果你拿到的是整份 JSON / YAML，也不需要手动区分格式，系统会自动判断并按外部配置导入。</p>
+                  </div>
+                </SectionCard>
+
+                <SectionCard title="导入后会发生什么">
+                  <div className="space-y-3 text-sm text-slate-300">
+                    <p>1. 自动识别输入属于分享链接、订阅内容还是完整配置。</p>
+                    <p>2. 自动为普通用户推荐最合适的内核，优先使用 `sing-box`。</p>
+                    <p>3. 导入成功后直接回到首页，点击“立即连接”就能开始使用。</p>
+                  </div>
+                </SectionCard>
+              </div>
+            </div>
+          ) : null}
+
+          {activeTab === 'exceptions' ? (
+            <div className="space-y-5">
+              {currentMode !== 'rule' ? (
+                <div className="rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
+                  当前模式是“{getModeLabel(currentMode)}”。网站与 App 例外主要在“智能分流”下生效，如需立即生效建议先切回“智能分流”。
+                </div>
+              ) : null}
+              <SectionCard
+                title="当前正在编辑的规则集"
+                action={
+                  <button className="rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200" onClick={() => {
+                    setActiveTab('advanced')
+                    setAdvancedTab('routing')
+                    setProfessionalMode(true)
+                  }}>
+                    打开高级路由
+                  </button>
+                }
+              >
+                <div className="grid gap-4 md:grid-cols-3">
+                  <SummaryStat title="默认路由集" value={activeRoutingItem?.remarks ?? '未初始化'} description={activeRoutingItem ? `规则数 ${activeRoutingItem.rule_num}` : '可在高级中初始化'} />
+                  <SummaryStat title="网站例外" value={`${hostRules.length} 条`} description={hostRules[0]?.domain[0] ?? '暂时为空'} />
+                  <SummaryStat title="App 例外" value={`${appRules.length} 条`} description={appRules[0]?.process[0] ?? '暂时为空'} />
+                </div>
+              </SectionCard>
+
+              <div className="grid gap-5 xl:grid-cols-2">
+                <SectionCard title="网站例外">
+                  <div className="grid gap-4 md:grid-cols-[1fr_180px_160px_auto]">
+                    <Field label="Host / 域名">
+                      <input value={hostRuleDraft.target} onChange={(event) => setHostRuleDraft((current) => ({ ...current, target: event.target.value }))} placeholder="example.com" />
+                    </Field>
+                    <Field label="动作">
+                      <select value={hostRuleDraft.action} onChange={(event) => setHostRuleDraft((current) => ({ ...current, action: event.target.value as SimpleRuleDraft['action'] }))}>
+                        <option value="proxy">走代理</option>
+                        <option value="direct">直接连接</option>
+                        <option value="block">阻止</option>
+                      </select>
+                    </Field>
+                    <Field label="优先级">
+                      <select value={hostRuleDraft.priority} onChange={(event) => setHostRuleDraft((current) => ({ ...current, priority: event.target.value as PriorityLevel }))}>
+                        <option value="high">高</option>
+                        <option value="normal">普通</option>
+                      </select>
+                    </Field>
+                    <div className="flex items-end">
+                      <ActionButton onClick={() => addSimpleRule('host')}>新增规则</ActionButton>
+                    </div>
+                  </div>
+                  <div className="mt-4 space-y-3">
+                    {hostRules.length === 0 ? <EmptyState title="还没有网站例外" description="例如：让 `google.com` 走代理，或让公司内网域名直接连接。" /> : null}
+                    {hostRules.map((rule) => (
+                      <SimpleRuleCard key={rule.id} title={rule.domain.join(', ')} action={rule.outbound_tag ?? 'proxy'} remarks={rule.remarks ?? ''} onRemove={() => removeSimpleRule(rule.id)} />
+                    ))}
+                  </div>
+                </SectionCard>
+
+                <SectionCard title="App 例外">
+                  <div className="grid gap-4 md:grid-cols-[1fr_180px_160px_auto]">
+                    <Field label="App / 进程名">
+                      <input value={appRuleDraft.target} onChange={(event) => setAppRuleDraft((current) => ({ ...current, target: event.target.value }))} placeholder="Telegram.exe / WeChat" />
+                    </Field>
+                    <Field label="动作">
+                      <select value={appRuleDraft.action} onChange={(event) => setAppRuleDraft((current) => ({ ...current, action: event.target.value as SimpleRuleDraft['action'] }))}>
+                        <option value="proxy">走代理</option>
+                        <option value="direct">直接连接</option>
+                        <option value="block">阻止</option>
+                      </select>
+                    </Field>
+                    <Field label="优先级">
+                      <select value={appRuleDraft.priority} onChange={(event) => setAppRuleDraft((current) => ({ ...current, priority: event.target.value as PriorityLevel }))}>
+                        <option value="high">高</option>
+                        <option value="normal">普通</option>
+                      </select>
+                    </Field>
+                    <div className="flex items-end">
+                      <ActionButton onClick={() => addSimpleRule('app')}>新增规则</ActionButton>
+                    </div>
+                  </div>
+                  <div className="mt-4 space-y-3">
+                    {appRules.length === 0 ? <EmptyState title="还没有 App 例外" description="例如：让 `Telegram` 全部走代理，或者让公司办公软件直接连接。" /> : null}
+                    {appRules.map((rule) => (
+                      <SimpleRuleCard key={rule.id} title={rule.process.join(', ')} action={rule.outbound_tag ?? 'proxy'} remarks={rule.remarks ?? ''} onRemove={() => removeSimpleRule(rule.id)} />
+                    ))}
+                  </div>
+                </SectionCard>
+              </div>
+            </div>
+          ) : null}
+
+          {activeTab === 'advanced' ? (
+            <div className="mb-5 space-y-5">
+              <SectionCard title="高级能力入口">
+                {!professionalMode ? (
+                  <div className="space-y-4 text-sm text-slate-300">
+                    <p>普通模式下，协议细节、路由模板、Clash 调试和日志默认折叠，避免普通用户被复杂概念打断。</p>
+                    <p>需要排障、手工改协议参数或维护路由模板时，再开启专业模式即可。</p>
+                    <button className="rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200" onClick={() => setProfessionalMode(true)}>
+                      开启专业模式
+                    </button>
+                  </div>
+                ) : (
+                  <div className="flex flex-wrap gap-2">
+                    {advancedTabs.map((tab) => (
+                      <button
+                        key={tab.key}
+                        className={`rounded-xl px-3 py-2 text-sm ${advancedTab === tab.key ? 'bg-violet-500/20 text-violet-100' : 'border border-slate-700 text-slate-300'}`}
+                        onClick={() => setAdvancedTab(tab.key)}
+                      >
+                        {tab.label}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </SectionCard>
+
+              {!professionalMode ? (
+                <div className="grid gap-5 xl:grid-cols-[1fr_1fr]">
+                  <SectionCard title="核心安装状态">
+                    <div className="grid gap-4">
+                      {status.core_assets.map((asset) => (
+                        <CoreCard
+                          key={asset.core_type}
+                          asset={asset}
+                          busy={busyAction === `download-${asset.core_type}`}
+                          recommended={asset.core_type === recommendedCore}
+                          onDownload={() => void handleCoreDownload(asset.core_type)}
+                        />
+                      ))}
+                    </div>
+                  </SectionCard>
+                  <SectionCard
+                    title="配置预览"
+                    action={
+                      <ActionButton busy={previewLoading} onClick={() => void refreshPreview()}>
+                        刷新预览
+                      </ActionButton>
+                    }
+                  >
+                    {previewStale ? (
+                      <div className="mb-3 rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
+                        当前预览可能已过期，等待自动保存完成后再刷新会更准确。
+                      </div>
+                    ) : null}
+                    <pre className="max-h-[34rem] overflow-auto rounded-2xl bg-slate-950 p-4 text-xs text-slate-200">
+                      {preview}
+                    </pre>
+                  </SectionCard>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+
+          {activeTab === 'advanced' && professionalMode && advancedTab === 'profiles' ? (
             <div className="grid gap-5 lg:grid-cols-[360px_1fr]">
               <SectionCard title="节点列表" action={<button className="rounded-xl border border-slate-700 px-3 py-2 text-sm" onClick={addProfile}>新增节点</button>}>
                 <div className="space-y-2">
@@ -1168,10 +1971,9 @@ function App() {
                       }`}
                       onClick={() => {
                         setSelectedProfileId(profile.id)
-                        void desktopApi
-                          .selectProfile(profile.id)
-                          .then((nextConfig) => setConfig(nextConfig))
-                          .catch((error) => setMessage(String(error)))
+                        updateConfig((draft) => {
+                          draft.selected_profile_id = profile.id
+                        })
                       }}
                     >
                       <p className="font-medium text-slate-100">{profile.name}</p>
@@ -1187,10 +1989,10 @@ function App() {
                         className="mt-3 rounded-lg border border-slate-700 px-2 py-1 text-xs text-slate-300 hover:border-rose-400 hover:text-rose-200"
                         onClick={(event) => {
                           event.stopPropagation()
-                          void desktopApi
-                            .removeProfile(profile.id)
+                          void runWithFlushedConfig(() => desktopApi.removeProfile(profile.id))
                             .then((nextConfig) => {
                               setConfig(nextConfig)
+                              setSaveState('idle')
                               setSelectedProfileId(nextConfig.selected_profile_id ?? nextConfig.profiles[0]?.id ?? '')
                             })
                             .catch((error) => setMessage(String(error)))
@@ -1348,7 +2150,7 @@ function App() {
             </div>
           ) : null}
 
-          {activeTab === 'subscriptions' ? (
+          {activeTab === 'advanced' && professionalMode && advancedTab === 'subscriptions' ? (
             <SectionCard
               title="订阅管理"
               action={
@@ -1358,10 +2160,12 @@ function App() {
                     className="rounded-xl border border-slate-700 px-3 py-2 text-sm"
                     onClick={() => {
                       setBusyAction('subscription-refresh-all')
-                      void desktopApi.refreshAllSubscriptionsInBackground('sing_box').catch((error) => {
-                        setBusyAction(null)
-                        setMessage(String(error))
-                      })
+                      void flushPendingConfigIfNeeded()
+                        .then(() => desktopApi.refreshAllSubscriptionsInBackground(recommendedCore))
+                        .catch((error) => {
+                          setBusyAction(null)
+                          setMessage(String(error))
+                        })
                     }}
                   >
                     {busyAction === 'subscription-refresh-all' ? '刷新中...' : '刷新全部'}
@@ -1504,17 +2308,19 @@ function App() {
                     <div className="mt-4 flex flex-wrap items-end gap-2">
                       <div className="flex items-end gap-2">
                         <ActionButton busy={busyAction === 'subscription-save'} onClick={() => void handleSaveSubscription(subscription)}>
-                          保存
+                          立即保存
                         </ActionButton>
-                        <ActionButton busy={busyAction === `subscription-refresh-${subscription.id}`} onClick={() => void handleRefreshSubscription(subscription.id, 'sing_box')}>
+                        <ActionButton busy={busyAction === `subscription-refresh-${subscription.id}`} onClick={() => void handleRefreshSubscription(subscription.id, subscription.convert_core_target ?? recommendedCore)}>
                           刷新
                         </ActionButton>
                         <button
                           className="rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200"
                           onClick={() => {
-                            void desktopApi
-                              .removeSubscription(subscription.id)
-                              .then((nextConfig) => setConfig(nextConfig))
+                            void runWithFlushedConfig(() => desktopApi.removeSubscription(subscription.id))
+                              .then((nextConfig) => {
+                                setConfig(nextConfig)
+                                setSaveState('idle')
+                              })
                               .catch((error) => setMessage(String(error)))
                           }}
                         >
@@ -1533,7 +2339,7 @@ function App() {
             </SectionCard>
           ) : null}
 
-          {activeTab === 'settings' ? (
+          {activeTab === 'advanced' && professionalMode && advancedTab === 'settings' ? (
             <div className="grid gap-5 lg:grid-cols-[1fr_1fr]">
               <SectionCard title="本地代理端口">
                 <div className="grid gap-4 md:grid-cols-2">
@@ -1718,7 +2524,7 @@ function App() {
             </div>
           ) : null}
 
-          {activeTab === 'routing' ? (
+          {activeTab === 'advanced' && professionalMode && advancedTab === 'routing' ? (
             <div className="grid gap-5 xl:grid-cols-[0.9fr_1.1fr_1.2fr]">
               <SectionCard
                 title="路由集"
@@ -1781,8 +2587,9 @@ function App() {
                               className="rounded-xl border border-slate-700 px-3 py-1 text-xs"
                               onClick={(event) => {
                                 event.stopPropagation()
-                                void desktopApi.setDefaultRoutingItem(item.id).then(async (nextConfig) => {
+                                void runWithFlushedConfig(() => desktopApi.setDefaultRoutingItem(item.id)).then((nextConfig) => {
                                   setConfig(nextConfig)
+                                  setSaveState('idle')
                                   setMessage('默认路由集已切换')
                                   setPreviewStale(true)
                                 }).catch((error) => setMessage(String(error)))
@@ -1794,8 +2601,9 @@ function App() {
                               className="rounded-xl border border-rose-800 px-3 py-1 text-xs text-rose-300"
                               onClick={(event) => {
                                 event.stopPropagation()
-                                void desktopApi.removeRoutingItem(item.id).then((nextConfig) => {
+                                void runWithFlushedConfig(() => desktopApi.removeRoutingItem(item.id)).then((nextConfig) => {
                                   setConfig(nextConfig)
+                                  setSaveState('idle')
                                   setMessage('路由集已删除')
                                 }).catch((error) => setMessage(String(error)))
                               }}
@@ -1825,10 +2633,11 @@ function App() {
                           return
                         }
                         setBusyAction('routing-import')
-                        void desktopApi
-                          .importRoutingRules(selectedRouting.id, raw, false)
+                        void flushPendingConfigIfNeeded()
+                          .then(() => desktopApi.importRoutingRules(selectedRouting.id, raw, false))
                           .then((nextConfig) => {
                             setConfig(nextConfig)
+                            setSaveState('idle')
                             setMessage('路由规则已导入')
                             setPreviewStale(true)
                           })
@@ -1871,8 +2680,9 @@ function App() {
                               onClick={(event) => {
                                 event.stopPropagation()
                                 if (!selectedRouting) return
-                                void desktopApi.moveRoutingRule(selectedRouting.id, rule.id, 'up').then((nextConfig) => {
+                                void runWithFlushedConfig(() => desktopApi.moveRoutingRule(selectedRouting.id, rule.id, 'up')).then((nextConfig) => {
                                   setConfig(nextConfig)
+                                  setSaveState('idle')
                                 }).catch((error) => setMessage(String(error)))
                               }}
                             >
@@ -1883,8 +2693,9 @@ function App() {
                               onClick={(event) => {
                                 event.stopPropagation()
                                 if (!selectedRouting) return
-                                void desktopApi.moveRoutingRule(selectedRouting.id, rule.id, 'down').then((nextConfig) => {
+                                void runWithFlushedConfig(() => desktopApi.moveRoutingRule(selectedRouting.id, rule.id, 'down')).then((nextConfig) => {
                                   setConfig(nextConfig)
+                                  setSaveState('idle')
                                 }).catch((error) => setMessage(String(error)))
                               }}
                             >
@@ -1974,7 +2785,7 @@ function App() {
             </div>
           ) : null}
 
-          {activeTab === 'clash' ? (
+          {activeTab === 'advanced' && professionalMode && advancedTab === 'clash' ? (
             status.runtime.running && status.runtime.core_type === 'mihomo' ? (
               <div className="grid gap-5 xl:grid-cols-[0.85fr_1fr_1fr]">
                 <SectionCard
@@ -2104,7 +2915,7 @@ function App() {
             )
           ) : null}
 
-          {activeTab === 'logs' ? (
+          {activeTab === 'advanced' && professionalMode && advancedTab === 'logs' ? (
             <SectionCard title="核心日志">
               <div className="mb-4 flex items-center justify-between text-sm text-slate-400">
                 <span>共 {logs.length} 条日志</span>
@@ -2153,7 +2964,7 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
   return (
     <label className="block">
       <span className="mb-2 block text-sm text-slate-400">{label}</span>
-      <div className="rounded-2xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 [&_input]:w-full [&_input]:bg-transparent [&_input]:outline-none [&_select]:w-full [&_select]:bg-transparent [&_select]:outline-none">
+      <div className="rounded-2xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 [&_input]:w-full [&_input]:bg-transparent [&_input]:outline-none [&_select]:w-full [&_select]:bg-transparent [&_select]:outline-none [&_textarea]:w-full [&_textarea]:bg-transparent [&_textarea]:outline-none">
         {children}
       </div>
     </label>
@@ -2172,23 +2983,147 @@ function KeyValue({ label, value, mono }: { label: string; value: string; mono?:
 function CoreCard({
   asset,
   busy,
+  recommended,
   onDownload,
 }: {
   asset: CoreAssetStatus
   busy: boolean
+  recommended?: boolean
   onDownload: () => void
 }) {
   return (
     <div className="rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
-      <p className="text-lg font-medium text-slate-100">
-        {asset.core_type === 'sing_box' ? 'sing-box' : asset.core_type === 'mihomo' ? 'mihomo' : 'Xray'}
-      </p>
+      <div className="flex items-center justify-between gap-3">
+        <p className="text-lg font-medium text-slate-100">{formatCoreType(asset.core_type)}</p>
+        {recommended ? <span className="rounded-full bg-violet-500/20 px-2 py-1 text-xs text-violet-100">推荐</span> : null}
+      </div>
       <p className="mt-2 text-sm text-slate-400">已安装：{asset.installed_version ?? '未安装'}</p>
       <p className="mt-1 text-sm text-slate-400">最新：{asset.latest_version ?? '未知'}</p>
       <p className="mt-2 break-all font-mono text-[11px] text-slate-500">{asset.executable_path ?? '尚无可执行文件'}</p>
       <ActionButton busy={busy} onClick={onDownload} className="mt-4 w-full justify-center">
         下载 / 更新
       </ActionButton>
+    </div>
+  )
+}
+
+function QuickStepCard({
+  index,
+  title,
+  description,
+  done,
+  action,
+}: {
+  index: number
+  title: string
+  description: string
+  done: boolean
+  action?: ReactNode
+}) {
+  return (
+    <div className="rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
+      <div className="flex items-center justify-between gap-3">
+        <span className="rounded-full bg-slate-800 px-2 py-1 text-xs text-slate-300">步骤 {index}</span>
+        <StatusPill label={done ? '已完成' : '待完成'} tone={done ? 'success' : 'muted'} />
+      </div>
+      <p className="mt-3 text-base font-medium text-slate-100">{title}</p>
+      <p className="mt-2 text-sm text-slate-400">{description}</p>
+      {action ? <div className="mt-4">{action}</div> : null}
+    </div>
+  )
+}
+
+function ModeOptionCard({
+  title,
+  description,
+  active,
+  onClick,
+}: {
+  title: string
+  description: string
+  active: boolean
+  onClick: () => void
+}) {
+  return (
+    <button
+      className={`rounded-2xl border px-4 py-4 text-left transition ${
+        active ? 'border-violet-500/50 bg-violet-500/10' : 'border-slate-800 bg-slate-950/70 hover:border-slate-700'
+      }`}
+      onClick={onClick}
+    >
+      <p className="font-medium text-slate-100">{title}</p>
+      <p className="mt-2 text-sm text-slate-400">{description}</p>
+    </button>
+  )
+}
+
+function SummaryStat({ title, value, description }: { title: string; value: string; description: string }) {
+  return (
+    <div className="rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
+      <p className="text-xs uppercase tracking-wide text-slate-500">{title}</p>
+      <p className="mt-2 text-xl font-semibold text-slate-100">{value}</p>
+      <p className="mt-2 text-sm text-slate-400">{description}</p>
+    </div>
+  )
+}
+
+function StatusPill({
+  label,
+  tone,
+}: {
+  label: string
+  tone: 'success' | 'muted' | 'warning'
+}) {
+  const palette =
+    tone === 'success'
+      ? 'bg-emerald-500/10 text-emerald-200'
+      : tone === 'warning'
+        ? 'bg-amber-500/10 text-amber-100'
+        : 'bg-slate-800 text-slate-300'
+  return <span className={`inline-flex items-center rounded-full px-3 py-1 text-xs ${palette}`}>{label}</span>
+}
+
+function EmptyState({
+  title,
+  description,
+  action,
+}: {
+  title: string
+  description: string
+  action?: ReactNode
+}) {
+  return (
+    <div className="rounded-2xl border border-dashed border-slate-700 p-6 text-sm text-slate-400">
+      <p className="font-medium text-slate-200">{title}</p>
+      <p className="mt-2">{description}</p>
+      {action ? <div className="mt-4">{action}</div> : null}
+    </div>
+  )
+}
+
+function SimpleRuleCard({
+  title,
+  action,
+  remarks,
+  onRemove,
+}: {
+  title: string
+  action: string
+  remarks: string
+  onRemove: () => void
+}) {
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
+      <div>
+        <p className="font-medium text-slate-100">{title}</p>
+        <p className="mt-1 text-xs text-slate-500">{remarks || '普通模式规则'}</p>
+      </div>
+      <div className="flex items-center gap-3">
+        <StatusPill label={formatRuleAction(action)} tone={action === 'block' ? 'warning' : 'success'} />
+        <button className="rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200" onClick={onRemove}>
+          删除
+        </button>
+      </div>
     </div>
   )
 }
@@ -2226,6 +3161,78 @@ function formatBytes(value?: number | null) {
     return `${(value / 1024).toFixed(1)} KB`
   }
   return `${(value / (1024 * 1024)).toFixed(1)} MB`
+}
+
+function formatCoreType(coreType: CoreType) {
+  if (coreType === 'sing_box') {
+    return 'sing-box'
+  }
+  if (coreType === 'mihomo') {
+    return 'mihomo'
+  }
+  return 'Xray'
+}
+
+function getModeLabel(mode: QuickMode) {
+  if (mode === 'global') {
+    return '全局代理'
+  }
+  if (mode === 'direct') {
+    return '直接连接'
+  }
+  return '智能分流'
+}
+
+function formatRuleAction(action: string) {
+  if (action === 'direct') {
+    return '直接连接'
+  }
+  if (action === 'block') {
+    return '阻止'
+  }
+  return '走代理'
+}
+
+function formatImportFormat(format: ImportPreview['format']) {
+  switch (format) {
+    case 'share_links':
+      return '分享链接 / 订阅内容'
+    case 'sing_box_json':
+      return 'sing-box JSON'
+    case 'xray_json':
+      return 'Xray JSON'
+    case 'clash_yaml':
+      return 'Clash YAML'
+    default:
+      return '未知内容'
+  }
+}
+
+function isHttpUrl(raw: string) {
+  const text = raw.trim().toLowerCase()
+  return text.startsWith('http://') || text.startsWith('https://')
+}
+
+function looksLikeImportText(raw: string) {
+  const text = raw.trim().toLowerCase()
+  if (!text) {
+    return false
+  }
+  return (
+    isHttpUrl(text) ||
+    text.startsWith('vless://') ||
+    text.startsWith('vmess://') ||
+    text.startsWith('trojan://') ||
+    text.startsWith('ss://') ||
+    text.startsWith('hysteria2://') ||
+    text.startsWith('hy2://') ||
+    text.startsWith('tuic://') ||
+    text.startsWith('wireguard://') ||
+    text.startsWith('anytls://') ||
+    text.includes('proxies:') ||
+    text.startsWith('{') ||
+    text.startsWith('[')
+  )
 }
 
 async function mapWithConcurrency<T, R>(

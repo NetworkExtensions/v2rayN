@@ -31,6 +31,12 @@ async function httpGet<T>(path: string): Promise<T> {
   return res.json() as Promise<T>
 }
 
+async function httpGetText(path: string): Promise<string> {
+  const res = await fetch(`${HTTP_BASE}${path}`)
+  if (!res.ok) throw new Error(await res.text())
+  return res.text()
+}
+
 async function httpPost<T>(path: string, body?: unknown): Promise<T> {
   const res = await fetch(`${HTTP_BASE}${path}`, {
     method: 'POST',
@@ -146,7 +152,7 @@ export const desktopApi = {
 
   exportRoutingRules: isTauri
     ? (routingId: string, ruleIds?: string[]) => invoke<string>('export_routing_rules', { routingId, ruleIds })
-    : (routingId: string) => httpGet<string>(`/api/routing/item/${routingId}/rules`),
+    : (routingId: string) => httpGetText(`/api/routing/item/${routingId}/rules`),
 
   moveRoutingRule: isTauri
     ? (routingId: string, ruleId: string, direction: string) => invoke<AppConfig>('move_routing_rule', { routingId, ruleId, direction })
@@ -198,7 +204,7 @@ export const desktopApi = {
   // 配置预览
   generatePreview: isTauri
     ? () => invoke<string>('generate_config_preview')
-    : () => httpGet<string>('/api/preview'),
+    : () => httpGetText('/api/preview'),
 
   // 核心管理
   checkCoreAssets: isTauri
