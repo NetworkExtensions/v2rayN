@@ -213,6 +213,12 @@ export interface CoreLogEvent {
   message: string
 }
 
+export interface BackgroundTaskEvent {
+  task: string
+  success: boolean
+  message: string
+}
+
 export interface ProxyProbe {
   outbound_ip: string
   country?: string | null

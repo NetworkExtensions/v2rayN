@@ -2,8 +2,9 @@ use crate::{
     app_state::SharedState,
     domain,
     models::{
-        AppConfig, AppStatus, ClashConnection, ClashProxyGroup, CoreAssetStatus, CoreType,
-        ClashProxyProvider, ProxyProbe, RoutingItem, RoutingRule, RunningStatus, Subscription,
+        AppConfig, AppStatus, BackgroundTaskEvent, ClashConnection, ClashProxyGroup,
+        ClashProxyProvider, CoreAssetStatus, CoreType, ProxyProbe, RoutingItem, RoutingRule,
+        RunningStatus, Subscription,
     },
     network_probe,
     system_proxy,
@@ -15,15 +16,21 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
-fn load_status(app: &AppHandle, state: &SharedState) -> Result<AppStatus> {
+fn load_status(
+    _app: &AppHandle,
+    state: &SharedState,
+    core_assets: Vec<CoreAssetStatus>,
+    include_probe: bool,
+) -> Result<AppStatus> {
     let config = state.store.load()?;
-    let core_assets = crate::core_update::list_core_statuses(app, &state.core_paths)?;
-    let proxy_probe = if state.runtime.status().running {
+    let proxy_probe = if include_probe && state.runtime.status().running {
         network_probe::probe_proxy(config.proxy.socks_port).ok()
-    } else {
+    } else if include_probe {
         network_probe::probe_direct().ok()
+    } else {
+        None
     };
     Ok(AppStatus {
         paths: state.store.paths(),
@@ -40,6 +47,28 @@ fn build_client(user_agent: &str, proxy_url: Option<&str>) -> Result<Client> {
         builder = builder.proxy(Proxy::all(proxy_url)?);
     }
     builder.build().context("创建 HTTP 客户端失败")
+}
+
+fn load_cached_core_assets(state: &SharedState) -> Result<Vec<CoreAssetStatus>> {
+    let cached = state
+        .core_status_cache
+        .lock()
+        .map_err(|_| anyhow::anyhow!("核心状态缓存不可用"))?
+        .clone();
+    if cached.is_empty() {
+        crate::core_update::list_local_core_statuses(&state.core_paths)
+    } else {
+        Ok(cached)
+    }
+}
+
+fn update_core_status_cache(state: &SharedState, statuses: &[CoreAssetStatus]) -> Result<()> {
+    let mut cache = state
+        .core_status_cache
+        .lock()
+        .map_err(|_| anyhow::anyhow!("核心状态缓存不可用"))?;
+    *cache = statuses.to_vec();
+    Ok(())
 }
 
 fn download_text(url: &str, user_agent: &str, proxy_url: Option<&str>) -> Result<String> {
@@ -168,7 +197,15 @@ pub fn auto_refresh_due_subscriptions(state: &SharedState) -> Result<bool> {
 
 #[tauri::command]
 pub fn get_app_status(app: AppHandle, state: State<'_, SharedState>) -> Result<AppStatus, String> {
-    load_status(&app, &state).map_err(error_to_string)
+    let core_assets = crate::core_update::list_core_statuses(&app, &state.core_paths).map_err(error_to_string)?;
+    update_core_status_cache(&state, &core_assets).map_err(error_to_string)?;
+    load_status(&app, &state, core_assets, true).map_err(error_to_string)
+}
+
+#[tauri::command]
+pub fn get_app_status_light(app: AppHandle, state: State<'_, SharedState>) -> Result<AppStatus, String> {
+    let core_assets = load_cached_core_assets(&state).map_err(error_to_string)?;
+    load_status(&app, &state, core_assets, false).map_err(error_to_string)
 }
 
 #[tauri::command]
@@ -449,11 +486,15 @@ pub fn refresh_subscription(
 
 #[tauri::command]
 pub fn refresh_all_subscriptions(core_type: CoreType, state: State<'_, SharedState>) -> Result<AppConfig, String> {
+    refresh_all_subscriptions_impl(core_type, &state).map_err(error_to_string)
+}
+
+fn refresh_all_subscriptions_impl(core_type: CoreType, state: &SharedState) -> Result<AppConfig> {
     let _guard = state
         .subscription_refresh_lock
         .lock()
-        .map_err(|_| "订阅刷新锁不可用".to_string())?;
-    let mut config = state.store.load().map_err(error_to_string)?;
+        .map_err(|_| anyhow::anyhow!("订阅刷新锁不可用"))?;
+    let mut config = state.store.load()?;
     let import_dir = PathBuf::from(state.store.paths().bin_configs).join("imported");
     let socks_port = config.proxy.socks_port;
 
@@ -467,8 +508,35 @@ pub fn refresh_all_subscriptions(core_type: CoreType, state: State<'_, SharedSta
         }
     }
 
-    state.store.save(&config).map_err(error_to_string)?;
+    state.store.save(&config)?;
     Ok(config)
+}
+
+#[tauri::command]
+pub fn refresh_all_subscriptions_in_background(
+    app: AppHandle,
+    core_type: CoreType,
+) -> Result<(), String> {
+    thread::spawn(move || {
+        let state = app.state::<SharedState>();
+        let result = refresh_all_subscriptions_impl(core_type, &state);
+        let message = match &result {
+            Ok(_) => "全部订阅刷新完成".to_string(),
+            Err(error) => error.to_string(),
+        };
+        let _ = app.emit(
+            "background-task-finished",
+            BackgroundTaskEvent {
+                task: "subscription-refresh-all".into(),
+                success: result.is_ok(),
+                message,
+            },
+        );
+        if result.is_ok() {
+            let _ = app.emit("app-state-changed", "subscription_refresh_all");
+        }
+    });
+    Ok(())
 }
 
 #[tauri::command]
@@ -508,7 +576,9 @@ pub fn generate_config_preview(state: State<'_, SharedState>) -> Result<String, 
 
 #[tauri::command]
 pub fn check_core_assets(app: AppHandle, state: State<'_, SharedState>) -> Result<Vec<CoreAssetStatus>, String> {
-    crate::core_update::list_core_statuses(&app, &state.core_paths).map_err(error_to_string)
+    let statuses = crate::core_update::list_core_statuses(&app, &state.core_paths).map_err(error_to_string)?;
+    update_core_status_cache(&state, &statuses).map_err(error_to_string)?;
+    Ok(statuses)
 }
 
 #[tauri::command]
@@ -517,7 +587,15 @@ pub fn download_core_asset(
     core_type: CoreType,
     state: State<'_, SharedState>,
 ) -> Result<CoreAssetStatus, String> {
-    crate::core_update::download_core(&app, &state.core_paths, core_type).map_err(error_to_string)
+    let status = crate::core_update::download_core(&app, &state.core_paths, core_type).map_err(error_to_string)?;
+    let mut cache = load_cached_core_assets(&state).map_err(error_to_string)?;
+    if let Some(existing) = cache.iter_mut().find(|asset| asset.core_type == status.core_type) {
+        *existing = status.clone();
+    } else {
+        cache.push(status.clone());
+    }
+    update_core_status_cache(&state, &cache).map_err(error_to_string)?;
+    Ok(status)
 }
 
 #[tauri::command]

@@ -8,7 +8,7 @@ use crate::{
 use anyhow::{anyhow, Context, Result};
 use std::{
     fs::{self, File},
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::Mutex,
@@ -300,22 +300,44 @@ fn health_check_elevated_pids(pids: &[u32]) -> Result<()> {
 fn bind_log_file(app: &AppHandle, path: PathBuf, source: String) {
     let app = app.clone();
     thread::spawn(move || {
-        let mut cursor = 0usize;
+        let mut cursor = 0u64;
+        let mut remainder = String::new();
         loop {
-            if let Ok(file) = File::open(&path) {
-                let reader = BufReader::new(file);
-                let lines = reader.lines().map_while(|line| line.ok()).collect::<Vec<_>>();
-                for line in lines.iter().skip(cursor) {
-                    let _ = app.emit(
-                        "core-log",
-                        CoreLogEvent {
-                            level: "info".into(),
-                            source: source.clone(),
-                            message: line.clone(),
-                        },
-                    );
+            if let Ok(mut file) = File::open(&path) {
+                if let Ok(metadata) = file.metadata() {
+                    if metadata.len() < cursor {
+                        cursor = 0;
+                        remainder.clear();
+                    }
                 }
-                cursor = lines.len();
+
+                if file.seek(SeekFrom::Start(cursor)).is_ok() {
+                    let mut chunk = String::new();
+                    if file.read_to_string(&mut chunk).is_ok() {
+                        cursor = cursor.saturating_add(chunk.len() as u64);
+                        if !chunk.is_empty() {
+                            remainder.push_str(&chunk);
+                            let ends_with_newline = remainder.ends_with('\n') || remainder.ends_with('\r');
+                            let mut lines = remainder.lines().map(str::to_string).collect::<Vec<_>>();
+                            if ends_with_newline {
+                                remainder.clear();
+                            } else {
+                                remainder = lines.pop().unwrap_or_default();
+                            }
+
+                            for line in lines {
+                                let _ = app.emit(
+                                    "core-log",
+                                    CoreLogEvent {
+                                        level: "info".into(),
+                                        source: source.clone(),
+                                        message: line,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
             }
             thread::sleep(Duration::from_millis(500));
         }

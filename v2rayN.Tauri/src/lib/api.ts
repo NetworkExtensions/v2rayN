@@ -4,6 +4,7 @@ import { listen } from '@tauri-apps/api/event'
 import type {
   AppConfig,
   AppStatus,
+  BackgroundTaskEvent,
   ClashConnection,
   ClashProxyGroup,
   ClashProxyProvider,
@@ -18,7 +19,8 @@ import type {
 } from './types'
 
 export const desktopApi = {
-  getStatus: () => invoke<AppStatus>('get_app_status'),
+  getStatus: () => invoke<AppStatus>('get_app_status_light'),
+  getFullStatus: () => invoke<AppStatus>('get_app_status'),
   saveConfig: (config: AppConfig) => invoke<AppConfig>('save_app_config', { config }),
   initializeBuiltinRouting: (advancedOnly = false) =>
     invoke<AppConfig>('initialize_builtin_routing', { advancedOnly }),
@@ -47,6 +49,8 @@ export const desktopApi = {
     invoke<AppConfig>('refresh_subscription', { subscriptionId, coreType }),
   refreshAllSubscriptions: (coreType: CoreType) =>
     invoke<AppConfig>('refresh_all_subscriptions', { coreType }),
+  refreshAllSubscriptionsInBackground: (coreType: CoreType) =>
+    invoke<void>('refresh_all_subscriptions_in_background', { coreType }),
   removeProfile: (profileId: string) => invoke<AppConfig>('remove_profile', { profileId }),
   selectProfile: (profileId: string) => invoke<AppConfig>('select_profile', { profileId }),
   generatePreview: () => invoke<string>('generate_config_preview'),
@@ -76,4 +80,6 @@ export const desktopApi = {
     listen<CoreLogEvent>('core-log', ({ payload }) => handler(payload)),
   onAppStateChanged: (handler: (reason: string) => void) =>
     listen<string>('app-state-changed', ({ payload }) => handler(payload)),
+  onBackgroundTaskFinished: (handler: (event: BackgroundTaskEvent) => void) =>
+    listen<BackgroundTaskEvent>('background-task-finished', ({ payload }) => handler(payload)),
 }

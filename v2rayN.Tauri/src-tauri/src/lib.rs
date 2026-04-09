@@ -29,20 +29,24 @@ pub fn run() {
             let core_paths = CorePaths {
                 bin_root: std::path::PathBuf::from(store.paths().bin.clone()),
             };
+            let core_status_cache = crate::core_update::list_local_core_statuses(&core_paths)?;
 
             app.manage(SharedState {
                 store,
                 core_paths,
                 runtime: RuntimeManager::new(),
+                core_status_cache: Mutex::new(core_status_cache),
                 subscription_refresh_lock: Mutex::new(()),
             });
 
             start_subscription_scheduler(app.handle().clone());
+            start_core_status_scheduler(app.handle().clone());
 
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_app_status,
+            commands::get_app_status_light,
             commands::save_app_config,
             commands::initialize_builtin_routing,
             commands::import_routing_template_url,
@@ -59,6 +63,7 @@ pub fn run() {
             commands::remove_subscription,
             commands::refresh_subscription,
             commands::refresh_all_subscriptions,
+            commands::refresh_all_subscriptions_in_background,
             commands::remove_profile,
             commands::select_profile,
             commands::generate_config_preview,
@@ -117,5 +122,23 @@ fn start_subscription_scheduler(app: tauri::AppHandle) {
                 log::warn!("自动刷新订阅失败: {error}");
             }
         }
+    });
+}
+
+fn start_core_status_scheduler(app: tauri::AppHandle) {
+    thread::spawn(move || loop {
+        let state = app.state::<SharedState>();
+        match crate::core_update::list_core_statuses(&app, &state.core_paths) {
+            Ok(statuses) => {
+                if let Ok(mut cache) = state.core_status_cache.lock() {
+                    *cache = statuses;
+                }
+                let _ = app.emit("app-state-changed", "core_status_cache_updated");
+            }
+            Err(error) => {
+                log::warn!("刷新核心状态缓存失败: {error}");
+            }
+        }
+        thread::sleep(Duration::from_secs(1800));
     });
 }

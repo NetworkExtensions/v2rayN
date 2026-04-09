@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react'
-import { useEffect, useMemo, useState } from 'react'
+import { useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 
 import { desktopApi } from './lib/api'
 import type {
@@ -41,6 +41,8 @@ function App() {
   const [busyAction, setBusyAction] = useState<string | null>(null)
   const [message, setMessage] = useState<string>('')
   const [probeLoading, setProbeLoading] = useState(false)
+  const [previewLoading, setPreviewLoading] = useState(false)
+  const [previewStale, setPreviewStale] = useState(false)
   const [lastImportPreview, setLastImportPreview] = useState<ImportPreview | null>(null)
   const [clashProxyGroups, setClashProxyGroups] = useState<ClashProxyGroup[]>([])
   const [clashProxyProviders, setClashProxyProviders] = useState<ClashProxyProvider[]>([])
@@ -49,20 +51,53 @@ function App() {
   const [selectedRoutingRuleId, setSelectedRoutingRuleId] = useState<string>('')
   const [routingTemplateUrlDraft, setRoutingTemplateUrlDraft] = useState('')
   const [clashConnectionFilter, setClashConnectionFilter] = useState('')
+  const deferredClashConnectionFilter = useDeferredValue(clashConnectionFilter)
+  const logBufferRef = useRef<CoreLogEvent[]>([])
+  const appStateRefreshTimerRef = useRef<number | null>(null)
 
   useEffect(() => {
     void loadStatus()
+    void refreshPreview()
     const unlistenPromise = desktopApi.onCoreLog((event) => {
-      setLogs((current) => [...current.slice(-499), event])
+      logBufferRef.current.push(event)
     })
     const stateChangedPromise = desktopApi.onAppStateChanged(() => {
-      void loadStatus()
+      if (appStateRefreshTimerRef.current !== null) {
+        window.clearTimeout(appStateRefreshTimerRef.current)
+      }
+      appStateRefreshTimerRef.current = window.setTimeout(() => {
+        appStateRefreshTimerRef.current = null
+        void loadStatus()
+      }, 150)
+    })
+    const backgroundTaskPromise = desktopApi.onBackgroundTaskFinished((event) => {
+      setBusyAction((current) => (current === event.task ? null : current))
+      setMessage(event.message)
+      if (event.success && event.task.startsWith('subscription-refresh')) {
+        setPreviewStale(true)
+      }
     })
 
     return () => {
+      if (appStateRefreshTimerRef.current !== null) {
+        window.clearTimeout(appStateRefreshTimerRef.current)
+      }
       void unlistenPromise.then((unlisten) => unlisten())
       void stateChangedPromise.then((unlisten) => unlisten())
+      void backgroundTaskPromise.then((unlisten) => unlisten())
     }
+  }, [])
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      if (logBufferRef.current.length === 0) {
+        return
+      }
+      const nextLogs = logBufferRef.current.splice(0, logBufferRef.current.length)
+      setLogs((current) => [...current, ...nextLogs].slice(-500))
+    }, 200)
+
+    return () => window.clearInterval(timer)
   }, [])
 
   const selectedProfile = useMemo(() => {
@@ -76,6 +111,15 @@ function App() {
   const selectedRoutingRule = useMemo(() => {
     return selectedRouting?.rule_set.find((rule) => rule.id === selectedRoutingRuleId) ?? null
   }, [selectedRouting, selectedRoutingRuleId])
+  const [profileDraft, setProfileDraft] = useState<Profile | null>(null)
+  const [routingDraft, setRoutingDraft] = useState<RoutingItem | null>(null)
+  const [routingRuleDraft, setRoutingRuleDraft] = useState<RoutingRule | null>(null)
+  const profileDraftDirtyRef = useRef(false)
+  const routingDraftDirtyRef = useRef(false)
+  const routingRuleDraftDirtyRef = useRef(false)
+  const editingProfile = profileDraft ?? selectedProfile
+  const editingRouting = routingDraft ?? selectedRouting
+  const editingRoutingRule = routingRuleDraft ?? selectedRoutingRule
 
   const sortedClashProxyGroups = useMemo(() => {
     const groups = [...clashProxyGroups]
@@ -90,7 +134,7 @@ function App() {
   }, [clashProxyGroups, config?.clash.proxies_sorting])
 
   const filteredClashConnections = useMemo(() => {
-    const keyword = clashConnectionFilter.trim().toLowerCase()
+    const keyword = deferredClashConnectionFilter.trim().toLowerCase()
     if (!keyword) {
       return clashConnections
     }
@@ -107,7 +151,7 @@ function App() {
         .toLowerCase()
         .includes(keyword),
     )
-  }, [clashConnectionFilter, clashConnections])
+  }, [deferredClashConnectionFilter, clashConnections])
 
   useEffect(() => {
     if (activeTab === 'clash' && status?.runtime.running && status.runtime.core_type === 'mihomo') {
@@ -134,6 +178,86 @@ function App() {
   useEffect(() => {
     setRoutingTemplateUrlDraft(config?.routing.template_source_url ?? '')
   }, [config?.routing.template_source_url])
+
+  useEffect(() => {
+    profileDraftDirtyRef.current = false
+    setProfileDraft(selectedProfile ? structuredClone(selectedProfile) : null)
+  }, [selectedProfile])
+
+  useEffect(() => {
+    routingDraftDirtyRef.current = false
+    setRoutingDraft(selectedRouting ? structuredClone(selectedRouting) : null)
+  }, [selectedRouting])
+
+  useEffect(() => {
+    routingRuleDraftDirtyRef.current = false
+    setRoutingRuleDraft(selectedRoutingRule ? structuredClone(selectedRoutingRule) : null)
+  }, [selectedRoutingRule])
+
+  useEffect(() => {
+    if (!profileDraftDirtyRef.current || !profileDraft) {
+      return
+    }
+    const timer = window.setTimeout(() => {
+      profileDraftDirtyRef.current = false
+      setConfig((current) => {
+        if (!current) {
+          return current
+        }
+        const nextConfig = structuredClone(current)
+        const target = nextConfig.profiles.find((profile) => profile.id === profileDraft.id)
+        if (target) {
+          Object.assign(target, profileDraft)
+        }
+        return nextConfig
+      })
+    }, 250)
+    return () => window.clearTimeout(timer)
+  }, [profileDraft])
+
+  useEffect(() => {
+    if (!routingDraftDirtyRef.current || !routingDraft) {
+      return
+    }
+    const timer = window.setTimeout(() => {
+      routingDraftDirtyRef.current = false
+      setConfig((current) => {
+        if (!current) {
+          return current
+        }
+        const nextConfig = structuredClone(current)
+        const target = nextConfig.routing.items.find((item) => item.id === routingDraft.id)
+        if (target) {
+          Object.assign(target, routingDraft)
+        }
+        return nextConfig
+      })
+    }, 250)
+    return () => window.clearTimeout(timer)
+  }, [routingDraft])
+
+  useEffect(() => {
+    if (!routingRuleDraftDirtyRef.current || !routingRuleDraft || !selectedRoutingId) {
+      return
+    }
+    const timer = window.setTimeout(() => {
+      routingRuleDraftDirtyRef.current = false
+      setConfig((current) => {
+        if (!current) {
+          return current
+        }
+        const nextConfig = structuredClone(current)
+        const target = nextConfig.routing.items
+          .find((item) => item.id === selectedRoutingId)
+          ?.rule_set.find((rule) => rule.id === routingRuleDraft.id)
+        if (target) {
+          Object.assign(target, routingRuleDraft)
+        }
+        return nextConfig
+      })
+    }, 250)
+    return () => window.clearTimeout(timer)
+  }, [routingRuleDraft, selectedRoutingId])
 
   useEffect(() => {
     if (
@@ -211,10 +335,21 @@ function App() {
       setStatus(nextStatus)
       setConfig(nextStatus.config)
       setSelectedProfileId(nextStatus.config.selected_profile_id ?? nextStatus.config.profiles[0]?.id ?? '')
-      const generated = await desktopApi.generatePreview()
-      setPreview(generated)
     } catch (error) {
       setMessage(String(error))
+    }
+  }
+
+  async function refreshPreview() {
+    setPreviewLoading(true)
+    try {
+      const generated = await desktopApi.generatePreview()
+      setPreview(generated)
+      setPreviewStale(false)
+    } catch (error) {
+      setMessage(String(error))
+    } finally {
+      setPreviewLoading(false)
     }
   }
 
@@ -248,16 +383,14 @@ function App() {
         desktopApi.getClashConnections(),
       ])
       const enrichedGroups = runDelayTest
-        ? await Promise.all(
-            groups.map(async (group) => {
-              try {
-                const delay = await desktopApi.testClashProxyDelay(group.name)
-                return { ...group, last_delay_ms: delay }
-              } catch {
-                return group
-              }
-            }),
-          )
+        ? await mapWithConcurrency(groups, 3, async (group) => {
+            try {
+              const delay = await desktopApi.testClashProxyDelay(group.name)
+              return { ...group, last_delay_ms: delay }
+            } catch {
+              return group
+            }
+          })
         : groups
       setClashProxyGroups(enrichedGroups)
       setClashProxyProviders(providers)
@@ -294,7 +427,7 @@ function App() {
       setConfig(saved)
       setSelectedProfileId(saved.selected_profile_id ?? saved.profiles[0]?.id ?? '')
       setMessage(successMessage ?? '配置已保存')
-      setPreview(await desktopApi.generatePreview())
+      setPreviewStale(true)
     } catch (error) {
       setMessage(String(error))
     } finally {
@@ -343,13 +476,69 @@ function App() {
     setConfig(draft)
   }
 
-  function updateSelectedProfile(mutator: (profile: Profile) => void) {
-    updateConfig((draft) => {
-      const target = draft.profiles.find((profile) => profile.id === selectedProfileId)
-      if (target) {
-        mutator(target)
+  function updateProfileDraft(mutator: (profile: Profile) => void) {
+    setProfileDraft((current) => {
+      if (!current) {
+        return current
       }
+      const draft = structuredClone(current)
+      mutator(draft)
+      profileDraftDirtyRef.current = true
+      return draft
     })
+  }
+
+  function updateRoutingDraft(mutator: (item: RoutingItem) => void) {
+    setRoutingDraft((current) => {
+      if (!current) {
+        return current
+      }
+      const draft = structuredClone(current)
+      mutator(draft)
+      routingDraftDirtyRef.current = true
+      return draft
+    })
+  }
+
+  function updateRoutingRuleDraft(mutator: (rule: RoutingRule) => void) {
+    setRoutingRuleDraft((current) => {
+      if (!current) {
+        return current
+      }
+      const draft = structuredClone(current)
+      mutator(draft)
+      routingRuleDraftDirtyRef.current = true
+      return draft
+    })
+  }
+
+  function buildConfigWithDrafts(baseConfig: AppConfig) {
+    const draft = structuredClone(baseConfig)
+
+    if (profileDraft) {
+      const target = draft.profiles.find((profile) => profile.id === profileDraft.id)
+      if (target) {
+        Object.assign(target, profileDraft)
+      }
+    }
+
+    if (routingDraft) {
+      const target = draft.routing.items.find((item) => item.id === routingDraft.id)
+      if (target) {
+        Object.assign(target, routingDraft)
+      }
+    }
+
+    if (routingRuleDraft && selectedRoutingId) {
+      const target = draft.routing.items
+        .find((item) => item.id === selectedRoutingId)
+        ?.rule_set.find((rule) => rule.id === routingRuleDraft.id)
+      if (target) {
+        Object.assign(target, routingRuleDraft)
+      }
+    }
+
+    return draft
   }
 
   async function handleImport(coreType: CoreType) {
@@ -366,7 +555,7 @@ function App() {
       setImportText('')
       setLastImportPreview(null)
       setMessage('导入成功')
-      setPreview(await desktopApi.generatePreview())
+      setPreviewStale(true)
     } catch (error) {
       setMessage(String(error))
     } finally {
@@ -393,7 +582,7 @@ function App() {
       setSelectedProfileId(nextConfig.selected_profile_id ?? nextConfig.profiles[0]?.id ?? '')
       setImportText('')
       setMessage(previewResult.message ?? '完整配置导入成功')
-      setPreview(await desktopApi.generatePreview())
+      setPreviewStale(true)
     } catch (error) {
       setMessage(String(error))
     } finally {
@@ -420,7 +609,7 @@ function App() {
       const nextConfig = await desktopApi.refreshSubscription(subscriptionId, coreType)
       setConfig(nextConfig)
       setMessage('订阅刷新完成')
-      setPreview(await desktopApi.generatePreview())
+      setPreviewStale(true)
     } catch (error) {
       setMessage(String(error))
     } finally {
@@ -461,7 +650,7 @@ function App() {
       await desktopApi.startCore()
       const nextStatus = await syncRuntimeStatus()
       setMessage('核心已启动')
-      setPreview(await desktopApi.generatePreview())
+      setPreviewStale(true)
       await refreshProbe()
       if (nextStatus.runtime.core_type === 'mihomo') {
         await refreshClashState()
@@ -500,7 +689,7 @@ function App() {
       await desktopApi.restartCore()
       const nextStatus = await syncRuntimeStatus()
       setMessage('核心已重启')
-      setPreview(await desktopApi.generatePreview())
+      setPreviewStale(true)
       await refreshProbe()
       if (nextStatus.runtime.core_type === 'mihomo') {
         await refreshClashState()
@@ -602,7 +791,7 @@ function App() {
       const nextConfig = await desktopApi.initializeBuiltinRouting(advancedOnly)
       setConfig(nextConfig)
       setMessage(advancedOnly ? '已追加内置高级路由模板' : '已初始化内置路由模板')
-      setPreview(await desktopApi.generatePreview())
+      setPreviewStale(true)
     } catch (error) {
       setMessage(String(error))
     } finally {
@@ -620,7 +809,7 @@ function App() {
       const nextConfig = await desktopApi.importRoutingTemplateUrl(routingTemplateUrlDraft.trim(), true)
       setConfig(nextConfig)
       setMessage('路由模板已导入')
-      setPreview(await desktopApi.generatePreview())
+      setPreviewStale(true)
     } catch (error) {
       setMessage(String(error))
     } finally {
@@ -816,7 +1005,7 @@ function App() {
               </button>
               <button
                 className="rounded-xl border border-slate-700 px-4 py-2 text-sm text-slate-200 disabled:cursor-not-allowed disabled:text-slate-500"
-                onClick={() => void persistConfig(config, '配置已保存')}
+                onClick={() => void persistConfig(buildConfigWithDrafts(config), '配置已保存')}
                 disabled={busyAction !== null}
               >
                 保存配置
@@ -876,7 +1065,19 @@ function App() {
                 </div>
               </SectionCard>
 
-              <SectionCard title="配置预览">
+              <SectionCard
+                title="配置预览"
+                action={
+                  <ActionButton busy={previewLoading} onClick={() => void refreshPreview()}>
+                    刷新预览
+                  </ActionButton>
+                }
+              >
+                {previewStale ? (
+                  <div className="mb-3 rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
+                    当前预览可能已过期，保存配置或点击“刷新预览”后可查看最新生成结果。
+                  </div>
+                ) : null}
                 <pre className="max-h-[34rem] overflow-auto rounded-2xl bg-slate-950 p-4 text-xs text-slate-200">
                   {preview}
                 </pre>
@@ -961,13 +1162,13 @@ function App() {
               </SectionCard>
 
               <SectionCard title="节点编辑">
-                {selectedProfile ? (
+                {editingProfile ? (
                   <div className="grid gap-4 md:grid-cols-2">
                     <Field label="节点名称">
-                      <input value={selectedProfile.name} onChange={(event) => updateSelectedProfile((profile) => { profile.name = event.target.value })} />
+                      <input value={editingProfile.name} onChange={(event) => updateProfileDraft((profile) => { profile.name = event.target.value })} />
                     </Field>
                     <Field label="核心">
-                      <select value={selectedProfile.core_type} onChange={(event) => updateSelectedProfile((profile) => { profile.core_type = event.target.value as CoreType })}>
+                      <select value={editingProfile.core_type} onChange={(event) => updateProfileDraft((profile) => { profile.core_type = event.target.value as CoreType })}>
                         <option value="sing_box">sing-box</option>
                         <option value="xray">Xray</option>
                         <option value="mihomo">mihomo</option>
@@ -975,9 +1176,9 @@ function App() {
                     </Field>
                     <Field label="配置类型">
                       <select
-                        value={selectedProfile.config_type}
+                        value={editingProfile.config_type}
                         onChange={(event) =>
-                          updateSelectedProfile((profile) => {
+                          updateProfileDraft((profile) => {
                             profile.config_type = event.target.value as Profile['config_type']
                           })
                         }
@@ -988,9 +1189,9 @@ function App() {
                     </Field>
                     <Field label="Mux 覆盖">
                       <select
-                        value={selectedProfile.mux_override}
+                        value={editingProfile.mux_override}
                         onChange={(event) =>
-                          updateSelectedProfile((profile) => {
+                          updateProfileDraft((profile) => {
                             profile.mux_override = event.target.value as Profile['mux_override']
                           })
                         }
@@ -1000,13 +1201,13 @@ function App() {
                         <option value="force_disable">强制关闭</option>
                       </select>
                     </Field>
-                    {selectedProfile.config_type === 'external' ? (
+                    {editingProfile.config_type === 'external' ? (
                       <>
                         <Field label="外部配置格式">
                           <select
-                            value={selectedProfile.external_config_format ?? 'clash'}
+                            value={editingProfile.external_config_format ?? 'clash'}
                             onChange={(event) =>
-                              updateSelectedProfile((profile) => {
+                              updateProfileDraft((profile) => {
                                 profile.external_config_format = event.target.value as NonNullable<
                                   Profile['external_config_format']
                                 >
@@ -1020,9 +1221,9 @@ function App() {
                         </Field>
                         <Field label="外部配置路径">
                           <input
-                            value={selectedProfile.external_config_path ?? ''}
+                            value={editingProfile.external_config_path ?? ''}
                             onChange={(event) =>
-                              updateSelectedProfile((profile) => {
+                              updateProfileDraft((profile) => {
                                 profile.external_config_path = event.target.value
                               })
                             }
@@ -1032,7 +1233,7 @@ function App() {
                     ) : (
                       <>
                     <Field label="协议">
-                      <select value={selectedProfile.protocol} onChange={(event) => updateSelectedProfile((profile) => { profile.protocol = event.target.value as Profile['protocol'] })}>
+                      <select value={editingProfile.protocol} onChange={(event) => updateProfileDraft((profile) => { profile.protocol = event.target.value as Profile['protocol'] })}>
                         <option value="vless">VLESS</option>
                         <option value="vmess">VMess</option>
                         <option value="trojan">Trojan</option>
@@ -1045,57 +1246,57 @@ function App() {
                       </select>
                     </Field>
                     <Field label="地址">
-                      <input value={selectedProfile.server} onChange={(event) => updateSelectedProfile((profile) => { profile.server = event.target.value })} />
+                      <input value={editingProfile.server} onChange={(event) => updateProfileDraft((profile) => { profile.server = event.target.value })} />
                     </Field>
                     <Field label="端口">
-                      <input type="number" value={selectedProfile.port} onChange={(event) => updateSelectedProfile((profile) => { profile.port = Number(event.target.value) || 0 })} />
+                      <input type="number" value={editingProfile.port} onChange={(event) => updateProfileDraft((profile) => { profile.port = Number(event.target.value) || 0 })} />
                     </Field>
                     <Field label="UUID / 用户 ID">
-                      <input value={selectedProfile.uuid ?? ''} onChange={(event) => updateSelectedProfile((profile) => { profile.uuid = event.target.value })} />
+                      <input value={editingProfile.uuid ?? ''} onChange={(event) => updateProfileDraft((profile) => { profile.uuid = event.target.value })} />
                     </Field>
                     <Field label="密码">
-                      <input value={selectedProfile.password ?? ''} onChange={(event) => updateSelectedProfile((profile) => { profile.password = event.target.value })} />
+                      <input value={editingProfile.password ?? ''} onChange={(event) => updateProfileDraft((profile) => { profile.password = event.target.value })} />
                     </Field>
                     <Field label="加密方法">
-                      <input value={selectedProfile.method ?? ''} onChange={(event) => updateSelectedProfile((profile) => { profile.method = event.target.value })} />
+                      <input value={editingProfile.method ?? ''} onChange={(event) => updateProfileDraft((profile) => { profile.method = event.target.value })} />
                     </Field>
                     <Field label="网络">
-                      <select value={selectedProfile.network} onChange={(event) => updateSelectedProfile((profile) => { profile.network = event.target.value })}>
+                      <select value={editingProfile.network} onChange={(event) => updateProfileDraft((profile) => { profile.network = event.target.value })}>
                         <option value="tcp">tcp</option>
                         <option value="ws">ws</option>
                         <option value="grpc">grpc</option>
                       </select>
                     </Field>
                     <Field label="安全层">
-                      <select value={selectedProfile.security} onChange={(event) => updateSelectedProfile((profile) => { profile.security = event.target.value; profile.tls = event.target.value !== 'none' })}>
+                      <select value={editingProfile.security} onChange={(event) => updateProfileDraft((profile) => { profile.security = event.target.value; profile.tls = event.target.value !== 'none' })}>
                         <option value="none">none</option>
                         <option value="tls">tls</option>
                         <option value="reality">reality</option>
                       </select>
                     </Field>
                     <Field label="SNI">
-                      <input value={selectedProfile.sni ?? ''} onChange={(event) => updateSelectedProfile((profile) => { profile.sni = event.target.value })} />
+                      <input value={editingProfile.sni ?? ''} onChange={(event) => updateProfileDraft((profile) => { profile.sni = event.target.value })} />
                     </Field>
                     <Field label="Host / Header">
-                      <input value={selectedProfile.host ?? ''} onChange={(event) => updateSelectedProfile((profile) => { profile.host = event.target.value })} />
+                      <input value={editingProfile.host ?? ''} onChange={(event) => updateProfileDraft((profile) => { profile.host = event.target.value })} />
                     </Field>
                     <Field label="Path">
-                      <input value={selectedProfile.path ?? ''} onChange={(event) => updateSelectedProfile((profile) => { profile.path = event.target.value })} />
+                      <input value={editingProfile.path ?? ''} onChange={(event) => updateProfileDraft((profile) => { profile.path = event.target.value })} />
                     </Field>
                     <Field label="gRPC Service Name">
-                      <input value={selectedProfile.service_name ?? ''} onChange={(event) => updateSelectedProfile((profile) => { profile.service_name = event.target.value })} />
+                      <input value={editingProfile.service_name ?? ''} onChange={(event) => updateProfileDraft((profile) => { profile.service_name = event.target.value })} />
                     </Field>
                     <Field label="Flow">
-                      <input value={selectedProfile.flow ?? ''} onChange={(event) => updateSelectedProfile((profile) => { profile.flow = event.target.value })} />
+                      <input value={editingProfile.flow ?? ''} onChange={(event) => updateProfileDraft((profile) => { profile.flow = event.target.value })} />
                     </Field>
                     <Field label="Fingerprint">
-                      <input value={selectedProfile.fingerprint ?? ''} onChange={(event) => updateSelectedProfile((profile) => { profile.fingerprint = event.target.value })} />
+                      <input value={editingProfile.fingerprint ?? ''} onChange={(event) => updateProfileDraft((profile) => { profile.fingerprint = event.target.value })} />
                     </Field>
                     <Field label="Reality Public Key">
-                      <input value={selectedProfile.reality_public_key ?? ''} onChange={(event) => updateSelectedProfile((profile) => { profile.reality_public_key = event.target.value })} />
+                      <input value={editingProfile.reality_public_key ?? ''} onChange={(event) => updateProfileDraft((profile) => { profile.reality_public_key = event.target.value })} />
                     </Field>
                     <Field label="Reality Short ID">
-                      <input value={selectedProfile.reality_short_id ?? ''} onChange={(event) => updateSelectedProfile((profile) => { profile.reality_short_id = event.target.value })} />
+                      <input value={editingProfile.reality_short_id ?? ''} onChange={(event) => updateProfileDraft((profile) => { profile.reality_short_id = event.target.value })} />
                     </Field>
                       </>
                     )}
@@ -1115,14 +1316,10 @@ function App() {
                     className="rounded-xl border border-slate-700 px-3 py-2 text-sm"
                     onClick={() => {
                       setBusyAction('subscription-refresh-all')
-                      void desktopApi
-                        .refreshAllSubscriptions('sing_box')
-                        .then((nextConfig) => {
-                          setConfig(nextConfig)
-                          setMessage('全部订阅刷新完成')
-                        })
-                        .catch((error) => setMessage(String(error)))
-                        .finally(() => setBusyAction(null))
+                      void desktopApi.refreshAllSubscriptionsInBackground('sing_box').catch((error) => {
+                        setBusyAction(null)
+                        setMessage(String(error))
+                      })
                     }}
                   >
                     {busyAction === 'subscription-refresh-all' ? '刷新中...' : '刷新全部'}
@@ -1545,7 +1742,7 @@ function App() {
                                 void desktopApi.setDefaultRoutingItem(item.id).then(async (nextConfig) => {
                                   setConfig(nextConfig)
                                   setMessage('默认路由集已切换')
-                                  setPreview(await desktopApi.generatePreview())
+                                  setPreviewStale(true)
                                 }).catch((error) => setMessage(String(error)))
                               }}
                             >
@@ -1588,10 +1785,10 @@ function App() {
                         setBusyAction('routing-import')
                         void desktopApi
                           .importRoutingRules(selectedRouting.id, raw, false)
-                          .then(async (nextConfig) => {
+                          .then((nextConfig) => {
                             setConfig(nextConfig)
                             setMessage('路由规则已导入')
-                            setPreview(await desktopApi.generatePreview())
+                            setPreviewStale(true)
                           })
                           .catch((error) => setMessage(String(error)))
                           .finally(() => setBusyAction(null))
@@ -1602,23 +1799,21 @@ function App() {
                   </div>
                 }
               >
-                {!selectedRouting ? <div className="text-sm text-slate-400">请先选择左侧路由集。</div> : null}
-                {selectedRouting ? (
+                {!editingRouting ? <div className="text-sm text-slate-400">请先选择左侧路由集。</div> : null}
+                {editingRouting ? (
                   <div className="grid gap-4">
                     <Field label="备注">
-                      <input value={selectedRouting.remarks} onChange={(event) => updateConfig((draft) => {
-                        const item = draft.routing.items.find((entry) => entry.id === selectedRouting.id)
-                        if (item) item.remarks = event.target.value
+                      <input value={editingRouting.remarks} onChange={(event) => updateRoutingDraft((item) => {
+                        item.remarks = event.target.value
                       })} />
                     </Field>
                     <Field label="自定义 ruleset 路径">
-                      <input value={selectedRouting.custom_ruleset_path_4_singbox ?? ''} onChange={(event) => updateConfig((draft) => {
-                        const item = draft.routing.items.find((entry) => entry.id === selectedRouting.id)
-                        if (item) item.custom_ruleset_path_4_singbox = event.target.value
+                      <input value={editingRouting.custom_ruleset_path_4_singbox ?? ''} onChange={(event) => updateRoutingDraft((item) => {
+                        item.custom_ruleset_path_4_singbox = event.target.value
                       })} />
                     </Field>
                     <div className="space-y-2">
-                      {selectedRouting.rule_set.map((rule) => (
+                      {editingRouting.rule_set.map((rule) => (
                         <button
                           key={rule.id}
                           className={`w-full rounded-2xl border px-4 py-3 text-left ${selectedRoutingRuleId === rule.id ? 'border-violet-400 bg-violet-500/10' : 'border-slate-800 bg-slate-950/70'}`}
@@ -1662,28 +1857,25 @@ function App() {
               </SectionCard>
 
               <SectionCard title="规则详情">
-                {!selectedRoutingRule ? <div className="text-sm text-slate-400">请先选择一条规则。</div> : null}
-                {selectedRouting && selectedRoutingRule ? (
+                {!editingRoutingRule ? <div className="text-sm text-slate-400">请先选择一条规则。</div> : null}
+                {editingRouting && editingRoutingRule ? (
                   <div className="grid gap-4 md:grid-cols-2">
                     <Field label="备注">
-                      <input value={selectedRoutingRule.remarks ?? ''} onChange={(event) => updateConfig((draft) => {
-                        const rule = draft.routing.items.find((item) => item.id === selectedRouting.id)?.rule_set.find((entry) => entry.id === selectedRoutingRule.id)
-                        if (rule) rule.remarks = event.target.value
+                      <input value={editingRoutingRule.remarks ?? ''} onChange={(event) => updateRoutingRuleDraft((rule) => {
+                        rule.remarks = event.target.value
                       })} />
                     </Field>
                     <Field label="启用">
-                      <select value={String(selectedRoutingRule.enabled)} onChange={(event) => updateConfig((draft) => {
-                        const rule = draft.routing.items.find((item) => item.id === selectedRouting.id)?.rule_set.find((entry) => entry.id === selectedRoutingRule.id)
-                        if (rule) rule.enabled = event.target.value === 'true'
+                      <select value={String(editingRoutingRule.enabled)} onChange={(event) => updateRoutingRuleDraft((rule) => {
+                        rule.enabled = event.target.value === 'true'
                       })}>
                         <option value="true">true</option>
                         <option value="false">false</option>
                       </select>
                     </Field>
                     <Field label="RuleType">
-                      <select value={selectedRoutingRule.rule_type} onChange={(event) => updateConfig((draft) => {
-                        const rule = draft.routing.items.find((item) => item.id === selectedRouting.id)?.rule_set.find((entry) => entry.id === selectedRoutingRule.id)
-                        if (rule) rule.rule_type = event.target.value as RoutingRule['rule_type']
+                      <select value={editingRoutingRule.rule_type} onChange={(event) => updateRoutingRuleDraft((rule) => {
+                        rule.rule_type = event.target.value as RoutingRule['rule_type']
                       })}>
                         <option value="all">all</option>
                         <option value="routing">routing</option>
@@ -1691,9 +1883,8 @@ function App() {
                       </select>
                     </Field>
                     <Field label="Outbound">
-                      <select value={selectedRoutingRule.outbound_tag ?? 'proxy'} onChange={(event) => updateConfig((draft) => {
-                        const rule = draft.routing.items.find((item) => item.id === selectedRouting.id)?.rule_set.find((entry) => entry.id === selectedRoutingRule.id)
-                        if (rule) rule.outbound_tag = event.target.value
+                      <select value={editingRoutingRule.outbound_tag ?? 'proxy'} onChange={(event) => updateRoutingRuleDraft((rule) => {
+                        rule.outbound_tag = event.target.value
                       })}>
                         <option value="proxy">proxy</option>
                         <option value="direct">direct</option>
@@ -1701,45 +1892,38 @@ function App() {
                       </select>
                     </Field>
                     <Field label="Domain">
-                      <textarea className="min-h-24 w-full bg-transparent outline-none" value={selectedRoutingRule.domain.join('\n')} onChange={(event) => updateConfig((draft) => {
-                        const rule = draft.routing.items.find((item) => item.id === selectedRouting.id)?.rule_set.find((entry) => entry.id === selectedRoutingRule.id)
-                        if (rule) rule.domain = event.target.value.split('\n').map((item) => item.trim()).filter(Boolean)
+                      <textarea className="min-h-24 w-full bg-transparent outline-none" value={editingRoutingRule.domain.join('\n')} onChange={(event) => updateRoutingRuleDraft((rule) => {
+                        rule.domain = event.target.value.split('\n').map((item) => item.trim()).filter(Boolean)
                       })} />
                     </Field>
                     <Field label="IP">
-                      <textarea className="min-h-24 w-full bg-transparent outline-none" value={selectedRoutingRule.ip.join('\n')} onChange={(event) => updateConfig((draft) => {
-                        const rule = draft.routing.items.find((item) => item.id === selectedRouting.id)?.rule_set.find((entry) => entry.id === selectedRoutingRule.id)
-                        if (rule) rule.ip = event.target.value.split('\n').map((item) => item.trim()).filter(Boolean)
+                      <textarea className="min-h-24 w-full bg-transparent outline-none" value={editingRoutingRule.ip.join('\n')} onChange={(event) => updateRoutingRuleDraft((rule) => {
+                        rule.ip = event.target.value.split('\n').map((item) => item.trim()).filter(Boolean)
                       })} />
                     </Field>
                     <Field label="Process">
-                      <textarea className="min-h-24 w-full bg-transparent outline-none" value={selectedRoutingRule.process.join('\n')} onChange={(event) => updateConfig((draft) => {
-                        const rule = draft.routing.items.find((item) => item.id === selectedRouting.id)?.rule_set.find((entry) => entry.id === selectedRoutingRule.id)
-                        if (rule) rule.process = event.target.value.split('\n').map((item) => item.trim()).filter(Boolean)
+                      <textarea className="min-h-24 w-full bg-transparent outline-none" value={editingRoutingRule.process.join('\n')} onChange={(event) => updateRoutingRuleDraft((rule) => {
+                        rule.process = event.target.value.split('\n').map((item) => item.trim()).filter(Boolean)
                       })} />
                     </Field>
                     <Field label="Protocol">
-                      <input value={selectedRoutingRule.protocol.join(',')} onChange={(event) => updateConfig((draft) => {
-                        const rule = draft.routing.items.find((item) => item.id === selectedRouting.id)?.rule_set.find((entry) => entry.id === selectedRoutingRule.id)
-                        if (rule) rule.protocol = event.target.value.split(',').map((item) => item.trim()).filter(Boolean)
+                      <input value={editingRoutingRule.protocol.join(',')} onChange={(event) => updateRoutingRuleDraft((rule) => {
+                        rule.protocol = event.target.value.split(',').map((item) => item.trim()).filter(Boolean)
                       })} />
                     </Field>
                     <Field label="Port">
-                      <input value={selectedRoutingRule.port ?? ''} onChange={(event) => updateConfig((draft) => {
-                        const rule = draft.routing.items.find((item) => item.id === selectedRouting.id)?.rule_set.find((entry) => entry.id === selectedRoutingRule.id)
-                        if (rule) rule.port = event.target.value
+                      <input value={editingRoutingRule.port ?? ''} onChange={(event) => updateRoutingRuleDraft((rule) => {
+                        rule.port = event.target.value
                       })} />
                     </Field>
                     <Field label="Network">
-                      <input value={selectedRoutingRule.network ?? ''} onChange={(event) => updateConfig((draft) => {
-                        const rule = draft.routing.items.find((item) => item.id === selectedRouting.id)?.rule_set.find((entry) => entry.id === selectedRoutingRule.id)
-                        if (rule) rule.network = event.target.value
+                      <input value={editingRoutingRule.network ?? ''} onChange={(event) => updateRoutingRuleDraft((rule) => {
+                        rule.network = event.target.value
                       })} />
                     </Field>
                     <Field label="InboundTag">
-                      <input value={selectedRoutingRule.inbound_tag.join(',')} onChange={(event) => updateConfig((draft) => {
-                        const rule = draft.routing.items.find((item) => item.id === selectedRouting.id)?.rule_set.find((entry) => entry.id === selectedRoutingRule.id)
-                        if (rule) rule.inbound_tag = event.target.value.split(',').map((item) => item.trim()).filter(Boolean)
+                      <input value={editingRoutingRule.inbound_tag.join(',')} onChange={(event) => updateRoutingRuleDraft((rule) => {
+                        rule.inbound_tag = event.target.value.split(',').map((item) => item.trim()).filter(Boolean)
                       })} />
                     </Field>
                   </div>
@@ -2000,6 +2184,32 @@ function formatBytes(value?: number | null) {
     return `${(value / 1024).toFixed(1)} KB`
   }
   return `${(value / (1024 * 1024)).toFixed(1)} MB`
+}
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  mapper: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  if (items.length === 0) {
+    return []
+  }
+
+  const results = new Array<R>(items.length)
+  let nextIndex = 0
+  const workerCount = Math.max(1, Math.min(concurrency, items.length))
+
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (nextIndex < items.length) {
+        const currentIndex = nextIndex
+        nextIndex += 1
+        results[currentIndex] = await mapper(items[currentIndex], currentIndex)
+      }
+    }),
+  )
+
+  return results
 }
 
 export default App

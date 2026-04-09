@@ -452,6 +452,13 @@ pub struct CoreLogEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackgroundTaskEvent {
+    pub task: String,
+    pub success: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppStatus {
     pub paths: AppPaths,
     pub config: AppConfig,

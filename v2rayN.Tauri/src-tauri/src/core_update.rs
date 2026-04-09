@@ -45,6 +45,13 @@ pub fn list_core_statuses(app: &AppHandle, core_paths: &CorePaths) -> Result<Vec
         .collect()
 }
 
+pub fn list_local_core_statuses(core_paths: &CorePaths) -> Result<Vec<CoreAssetStatus>> {
+    [CoreType::Xray, CoreType::SingBox, CoreType::Mihomo]
+        .iter()
+        .map(|core_type| local_core_status(core_paths, core_type.clone()))
+        .collect()
+}
+
 pub fn download_core(app: &AppHandle, core_paths: &CorePaths, core_type: CoreType) -> Result<CoreAssetStatus> {
     let _ = app;
     let release = fetch_release(&core_type)?;
@@ -76,6 +83,21 @@ fn core_status(core_paths: &CorePaths, core_type: CoreType) -> Result<CoreAssetS
         installed_version,
         latest_version: latest_release.map(|release| release.tag_name),
         download_url,
+        executable_path: executable_path.map(|path| path.to_string_lossy().to_string()),
+    })
+}
+
+fn local_core_status(core_paths: &CorePaths, core_type: CoreType) -> Result<CoreAssetStatus> {
+    let executable_path = resolve_executable(core_paths, &core_type);
+    let installed_version = executable_path
+        .as_ref()
+        .and_then(|path| get_installed_version(path, &core_type).ok());
+
+    Ok(CoreAssetStatus {
+        core_type,
+        installed_version,
+        latest_version: None,
+        download_url: None,
         executable_path: executable_path.map(|path| path.to_string_lossy().to_string()),
     })
 }
