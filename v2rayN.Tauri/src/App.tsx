@@ -23,11 +23,23 @@ type AdvancedTabKey = 'profiles' | 'subscriptions' | 'routing' | 'settings' | 'c
 type QuickMode = 'rule' | 'global' | 'direct'
 type SimpleRuleKind = 'host' | 'app'
 type PriorityLevel = 'high' | 'normal'
+type HostRuleMatchType = 'domain' | 'domain_suffix' | 'domain_keyword' | 'ip_cidr'
 
 interface SimpleRuleDraft {
   target: string
   action: 'proxy' | 'direct' | 'block'
   priority: PriorityLevel
+}
+
+interface HostRuleDraft extends SimpleRuleDraft {
+  matchType: HostRuleMatchType
+}
+
+const hostRuleMatchTypeLabels: Record<HostRuleMatchType, string> = {
+  domain: '完整域名',
+  domain_suffix: '域名后缀',
+  domain_keyword: '域名关键词',
+  ip_cidr: 'IP / CIDR',
 }
 
 const primaryTabs: Array<{ key: PrimaryTabKey; label: string; description: string }> = [
@@ -70,7 +82,7 @@ function App() {
   const [previewStale, setPreviewStale] = useState(false)
   const [lastImportPreview, setLastImportPreview] = useState<ImportPreview | null>(null)
   const [clipboardSuggestion, setClipboardSuggestion] = useState<string>('')
-  const [hostRuleDraft, setHostRuleDraft] = useState<SimpleRuleDraft>({ target: '', action: 'proxy', priority: 'high' })
+  const [hostRuleDraft, setHostRuleDraft] = useState<HostRuleDraft>({ target: '', action: 'proxy', priority: 'high', matchType: 'domain' })
   const [appRuleDraft, setAppRuleDraft] = useState<SimpleRuleDraft>({ target: '', action: 'direct', priority: 'normal' })
   const [clashProxyGroups, setClashProxyGroups] = useState<ClashProxyGroup[]>([])
   const [clashProxyProviders, setClashProxyProviders] = useState<ClashProxyProvider[]>([])
@@ -221,7 +233,7 @@ function App() {
   const hostRules = useMemo(
     () =>
       (activeRoutingItem?.rule_set ?? []).filter(
-        (rule) => rule.domain.length > 0 && rule.process.length === 0 && ['proxy', 'direct', 'block'].includes(rule.outbound_tag ?? ''),
+        (rule) => (rule.domain.length > 0 || rule.ip.length > 0) && rule.process.length === 0 && ['proxy', 'direct', 'block'].includes(rule.outbound_tag ?? ''),
       ),
     [activeRoutingItem],
   )
@@ -1097,8 +1109,9 @@ function App() {
 
   function addSimpleRule(kind: SimpleRuleKind) {
     const draft = kind === 'host' ? hostRuleDraft : appRuleDraft
-    if (!draft.target.trim()) {
-      setMessage(kind === 'host' ? '请填写网站或 host' : '请填写 App 名称或进程名')
+    const target = draft.target.trim()
+    if (!target) {
+      setMessage(kind === 'host' ? getHostRuleValidationMessage(hostRuleDraft.matchType) : '请填写 App 名称或进程名')
       return
     }
     if (!activeRoutingItem) {
@@ -1115,16 +1128,19 @@ function App() {
         id: crypto.randomUUID(),
         rule_type: 'all',
         enabled: true,
-        remarks: kind === 'host' ? `网站例外 · ${draft.target.trim()}` : `App 例外 · ${draft.target.trim()}`,
+        remarks: kind === 'host' ? `网站例外 · ${target}` : `App 例外 · ${target}`,
         type_name: '',
         port: '',
         network: '',
         inbound_tag: [],
         outbound_tag: draft.action,
-        ip: [],
-        domain: kind === 'host' ? [draft.target.trim()] : [],
+        ...(
+          kind === 'host'
+            ? buildHostRuleMatcher(target, hostRuleDraft.matchType)
+            : { ip: [], domain: [] }
+        ),
         protocol: [],
-        process: kind === 'app' ? [draft.target.trim()] : [],
+        process: kind === 'app' ? [target] : [],
       }
       if (draft.priority === 'high') {
         routing.rule_set.unshift(rule)
@@ -1135,7 +1151,7 @@ function App() {
     })
 
     if (kind === 'host') {
-      setHostRuleDraft({ target: '', action: 'proxy', priority: 'high' })
+      setHostRuleDraft({ target: '', action: 'proxy', priority: 'high', matchType: 'domain' })
     } else {
       setAppRuleDraft({ target: '', action: 'direct', priority: 'normal' })
     }
@@ -1635,7 +1651,7 @@ function App() {
                   }
                 >
                   <div className="grid gap-4 md:grid-cols-2">
-                    <SummaryStat title="网站例外" value={`${hostRules.length} 条`} description={hostRules[0]?.domain[0] ?? '尚未添加'} />
+                  <SummaryStat title="网站例外" value={`${hostRules.length} 条`} description={hostRules[0] ? formatHostRuleSummary(hostRules[0]) : '尚未添加'} />
                     <SummaryStat title="App 例外" value={`${appRules.length} 条`} description={appRules[0]?.process[0] ?? '尚未添加'} />
                   </div>
                 </SectionCard>
@@ -1799,19 +1815,31 @@ function App() {
               >
                 <div className="grid gap-4 md:grid-cols-3">
                   <SummaryStat title="默认路由集" value={activeRoutingItem?.remarks ?? '未初始化'} description={activeRoutingItem ? `规则数 ${activeRoutingItem.rule_num}` : '可在高级中初始化'} />
-                  <SummaryStat title="网站例外" value={`${hostRules.length} 条`} description={hostRules[0]?.domain[0] ?? '暂时为空'} />
+                  <SummaryStat title="网站例外" value={`${hostRules.length} 条`} description={hostRules[0] ? formatHostRuleSummary(hostRules[0]) : '暂时为空'} />
                   <SummaryStat title="App 例外" value={`${appRules.length} 条`} description={appRules[0]?.process[0] ?? '暂时为空'} />
                 </div>
               </SectionCard>
 
               <div className="grid gap-5 xl:grid-cols-2">
                 <SectionCard title="网站例外">
-                  <div className="grid gap-4 md:grid-cols-[1fr_180px_160px_auto]">
-                    <Field label="Host / 域名">
-                      <input value={hostRuleDraft.target} onChange={(event) => setHostRuleDraft((current) => ({ ...current, target: event.target.value }))} placeholder="example.com" />
+                  <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-[minmax(0,1.1fr)_180px_180px_160px_auto]">
+                    <Field label="匹配内容">
+                      <input
+                        value={hostRuleDraft.target}
+                        onChange={(event) => setHostRuleDraft((current) => ({ ...current, target: event.target.value }))}
+                        placeholder={getHostRulePlaceholder(hostRuleDraft.matchType)}
+                      />
+                    </Field>
+                    <Field label="匹配类型">
+                      <select value={hostRuleDraft.matchType} onChange={(event) => setHostRuleDraft((current) => ({ ...current, matchType: event.target.value as HostRuleMatchType }))}>
+                        <option value="domain">完整域名</option>
+                        <option value="domain_suffix">域名后缀</option>
+                        <option value="domain_keyword">域名关键词</option>
+                        <option value="ip_cidr">IP / CIDR</option>
+                      </select>
                     </Field>
                     <Field label="动作">
-                      <select value={hostRuleDraft.action} onChange={(event) => setHostRuleDraft((current) => ({ ...current, action: event.target.value as SimpleRuleDraft['action'] }))}>
+                      <select value={hostRuleDraft.action} onChange={(event) => setHostRuleDraft((current) => ({ ...current, action: event.target.value as HostRuleDraft['action'] }))}>
                         <option value="proxy">走代理</option>
                         <option value="direct">直接连接</option>
                         <option value="block">阻止</option>
@@ -1828,9 +1856,9 @@ function App() {
                     </div>
                   </div>
                   <div className="mt-4 space-y-3">
-                    {hostRules.length === 0 ? <EmptyState title="还没有网站例外" description="例如：让 `google.com` 走代理，或让公司内网域名直接连接。" /> : null}
+                    {hostRules.length === 0 ? <EmptyState title="还没有网站例外" description="例如：完整域名 `www.google.com`、域名后缀 `google.com`、关键词 `google`，或 IP 段 `192.168.0.0/16`。" /> : null}
                     {hostRules.map((rule) => (
-                      <SimpleRuleCard key={rule.id} title={rule.domain.join(', ')} action={rule.outbound_tag ?? 'proxy'} remarks={rule.remarks ?? ''} onRemove={() => removeSimpleRule(rule.id)} />
+                      <SimpleRuleCard key={rule.id} title={formatHostRuleTitle(rule)} action={rule.outbound_tag ?? 'proxy'} remarks={rule.remarks ?? ''} onRemove={() => removeSimpleRule(rule.id)} />
                     ))}
                   </div>
                 </SectionCard>
@@ -3158,6 +3186,70 @@ function formatRuleAction(action: string) {
     return '阻止'
   }
   return '走代理'
+}
+
+function getHostRulePlaceholder(matchType: HostRuleMatchType) {
+  switch (matchType) {
+    case 'domain_suffix':
+      return 'google.com'
+    case 'domain_keyword':
+      return 'google'
+    case 'ip_cidr':
+      return '192.168.0.0/16'
+    default:
+      return 'www.google.com'
+  }
+}
+
+function getHostRuleValidationMessage(matchType: HostRuleMatchType) {
+  return matchType === 'ip_cidr' ? '请填写 IP 或 CIDR' : '请填写域名或关键词'
+}
+
+function buildHostRuleMatcher(target: string, matchType: HostRuleMatchType): Pick<RoutingRule, 'domain' | 'ip'> {
+  switch (matchType) {
+    case 'domain_suffix':
+      return { domain: [`domain:${target}`], ip: [] }
+    case 'domain_keyword':
+      return { domain: [`keyword:${target}`], ip: [] }
+    case 'ip_cidr':
+      return { domain: [], ip: [target] }
+    default:
+      return { domain: [`full:${target}`], ip: [] }
+  }
+}
+
+function formatHostRuleSummary(rule: RoutingRule) {
+  return formatHostRuleMatchers(rule)
+    .map((item) => item.value)
+    .join(' · ')
+}
+
+function formatHostRuleTitle(rule: RoutingRule) {
+  return formatHostRuleMatchers(rule)
+    .map((item) => `[${item.label}] ${item.value}`)
+    .join(' · ')
+}
+
+function formatHostRuleMatchers(rule: RoutingRule) {
+  const items = rule.domain
+    .map(parseHostDomainMatcher)
+    .concat(rule.ip.filter((value) => value.trim()).map((value) => ({ label: hostRuleMatchTypeLabels.ip_cidr, value })))
+
+  return items.filter((item) => item.value.trim())
+}
+
+function parseHostDomainMatcher(raw: string) {
+  const value = raw.replace('\\,', ',').trim()
+  if (value.startsWith('domain:')) {
+    return { label: hostRuleMatchTypeLabels.domain_suffix, value: value.slice('domain:'.length) }
+  }
+  if (value.startsWith('full:')) {
+    return { label: hostRuleMatchTypeLabels.domain, value: value.slice('full:'.length) }
+  }
+  if (value.startsWith('keyword:')) {
+    return { label: hostRuleMatchTypeLabels.domain_keyword, value: value.slice('keyword:'.length) }
+  }
+  return { label: hostRuleMatchTypeLabels.domain, value }
 }
 
 function formatImportFormat(format: ImportPreview['format']) {
