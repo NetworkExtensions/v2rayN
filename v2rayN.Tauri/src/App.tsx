@@ -23,7 +23,6 @@ type AdvancedTabKey = 'profiles' | 'subscriptions' | 'routing' | 'settings' | 'c
 type QuickMode = 'rule' | 'global' | 'direct'
 type SimpleRuleKind = 'host' | 'app'
 type PriorityLevel = 'high' | 'normal'
-type SaveState = 'idle' | 'dirty' | 'saving' | 'saved' | 'error'
 
 interface SimpleRuleDraft {
   target: string
@@ -60,7 +59,6 @@ function App() {
   const [preview, setPreview] = useState('')
   const [busyAction, setBusyAction] = useState<string | null>(null)
   const [message, setMessage] = useState<string>('')
-  const [saveState, setSaveState] = useState<SaveState>('idle')
   const [professionalMode, setProfessionalMode] = useState<boolean>(() => {
     if (typeof window === 'undefined') {
       return false
@@ -327,7 +325,6 @@ function App() {
           Object.assign(target, profileDraft)
         }
         autosavePendingRef.current = true
-        setSaveState('dirty')
         return nextConfig
       })
     }, 250)
@@ -350,7 +347,6 @@ function App() {
           Object.assign(target, routingDraft)
         }
         autosavePendingRef.current = true
-        setSaveState('dirty')
         return nextConfig
       })
     }, 250)
@@ -375,7 +371,6 @@ function App() {
           Object.assign(target, routingRuleDraft)
         }
         autosavePendingRef.current = true
-        setSaveState('dirty')
         return nextConfig
       })
     }, 250)
@@ -389,7 +384,6 @@ function App() {
     const timer = window.setTimeout(() => {
       const snapshot = buildConfigWithDrafts(config)
       autosavePendingRef.current = false
-      setSaveState('saving')
       void persistConfig(snapshot, { successMessage: '更改已自动保存', silent: true })
     }, 900)
     return () => window.clearTimeout(timer)
@@ -478,12 +472,10 @@ function App() {
         setStatus(nextStatus)
         setConfig(nextStatus.config)
         setSelectedProfileId(nextStatus.config.selected_profile_id ?? nextStatus.config.profiles[0]?.id ?? '')
-        setSaveState('idle')
       }
     } catch (error) {
       console.error('[loadStatus] failed:', error)
       setMessage(String(error))
-      setSaveState('error')
     }
   }
 
@@ -506,7 +498,6 @@ function App() {
       setStatus(nextStatus)
       setConfig(nextStatus.config)
       setSelectedProfileId(nextStatus.config.selected_profile_id ?? nextStatus.config.profiles[0]?.id ?? '')
-      setSaveState('idle')
     }
     return nextStatus
   }
@@ -578,19 +569,16 @@ function App() {
     if (trackBusy) {
       setBusyAction('save')
     }
-    setSaveState('saving')
     try {
       const saved = await desktopApi.saveConfig(nextConfig)
       setConfig(saved)
       setSelectedProfileId(saved.selected_profile_id ?? saved.profiles[0]?.id ?? '')
-      setSaveState('saved')
       if (!silent) {
         setMessage(successMessage ?? '配置已保存')
       }
       setPreviewStale(true)
       return saved
     } catch (error) {
-      setSaveState('error')
       setMessage(String(error))
       return null
     } finally {
@@ -639,7 +627,6 @@ function App() {
     const draft: AppConfig = structuredClone(config)
     mutator(draft)
     autosavePendingRef.current = true
-    setSaveState('dirty')
     setConfig(draft)
   }
 
@@ -768,7 +755,6 @@ function App() {
       setImportText('')
       setClipboardSuggestion('')
       setActiveTab('home')
-      setSaveState('idle')
       setMessage(
         previewResult.stores_as_external
           ? previewResult.message ?? '完整配置已导入，现在可以直接连接'
@@ -777,7 +763,6 @@ function App() {
       setPreviewStale(true)
     } catch (error) {
       setMessage(String(error))
-      setSaveState('error')
     } finally {
       setBusyAction(null)
     }
@@ -876,14 +861,12 @@ function App() {
         message: `订阅已添加，并按 ${formatCoreType(recommendedCore)} 完成转换`,
       })
       setActiveTab('home')
-      setSaveState('idle')
       setPreviewStale(true)
       setMessage(`订阅已添加并完成拉取，共导入 ${refreshedConfig.profiles.filter((profile) => profile.source_subscription_id === draft.id).length} 个节点`)
       setStatus((current) => (current ? { ...current, config: refreshedConfig } : current))
       void savedConfig
     } catch (error) {
       setMessage(String(error))
-      setSaveState('error')
     } finally {
       setBusyAction(null)
     }
@@ -894,7 +877,6 @@ function App() {
     try {
       const nextConfig = await desktopApi.saveSubscription(subscription)
       setConfig(nextConfig)
-      setSaveState('idle')
       setMessage('订阅已保存')
     } catch (error) {
       setMessage(String(error))
@@ -909,7 +891,6 @@ function App() {
       await flushPendingConfigIfNeeded()
       const nextConfig = await desktopApi.refreshSubscription(subscriptionId, coreType)
       setConfig(nextConfig)
-      setSaveState('idle')
       setMessage('订阅刷新完成')
       setPreviewStale(true)
     } catch (error) {
@@ -1070,7 +1051,6 @@ function App() {
         ? await desktopApi.enableSystemProxy()
         : await desktopApi.disableSystemProxy()
       setConfig(nextConfig)
-      setSaveState('idle')
       await syncRuntimeStatus()
       setMessage(enabled ? '系统代理已开启' : '系统代理已关闭')
     } catch (error) {
@@ -1235,7 +1215,6 @@ function App() {
       await flushPendingConfigIfNeeded()
       const nextConfig = await desktopApi.initializeBuiltinRouting(advancedOnly)
       setConfig(nextConfig)
-      setSaveState('idle')
       setMessage(advancedOnly ? '已追加内置高级路由模板' : '已初始化内置路由模板')
       setPreviewStale(true)
     } catch (error) {
@@ -1255,7 +1234,6 @@ function App() {
       await flushPendingConfigIfNeeded()
       const nextConfig = await desktopApi.importRoutingTemplateUrl(routingTemplateUrlDraft.trim(), true)
       setConfig(nextConfig)
-      setSaveState('idle')
       setMessage('路由模板已导入')
       setPreviewStale(true)
     } catch (error) {
@@ -1410,16 +1388,6 @@ function App() {
         ? '保留全部极客能力，但默认不打扰普通用户。'
         : '需要时再开启专业模式，日常使用优先走普通路径。'
       : primaryTabs.find((tab) => tab.key === activeTab)?.description ?? ''
-  const autoSaveLabel =
-    saveState === 'saving'
-      ? '自动保存中'
-      : saveState === 'saved'
-        ? '已自动保存'
-        : saveState === 'dirty'
-          ? '待自动保存'
-          : saveState === 'error'
-            ? '保存失败'
-            : '自动保存'
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100">
@@ -1487,16 +1455,7 @@ function App() {
                 </span>
               </p>
             </div>
-            <div className="flex flex-wrap gap-3">
-              <span className={`inline-flex items-center rounded-xl px-3 py-2 text-sm ${
-                saveState === 'error'
-                  ? 'bg-rose-500/10 text-rose-200'
-                  : saveState === 'saved'
-                    ? 'bg-emerald-500/10 text-emerald-200'
-                    : 'bg-slate-800 text-slate-300'
-              }`}>
-                {autoSaveLabel}
-              </span>
+            <div className="flex flex-wrap items-center gap-3">
               <button className="rounded-xl bg-violet-500 px-4 py-2 text-sm font-medium text-white disabled:cursor-not-allowed disabled:bg-slate-700" onClick={handleStart} disabled={busyAction !== null}>
                 {busyAction === 'start' ? '连接中...' : status.runtime.running ? '重新连接' : '立即连接'}
               </button>
@@ -1992,7 +1951,6 @@ function App() {
                           void runWithFlushedConfig(() => desktopApi.removeProfile(profile.id))
                             .then((nextConfig) => {
                               setConfig(nextConfig)
-                              setSaveState('idle')
                               setSelectedProfileId(nextConfig.selected_profile_id ?? nextConfig.profiles[0]?.id ?? '')
                             })
                             .catch((error) => setMessage(String(error)))
@@ -2319,7 +2277,6 @@ function App() {
                             void runWithFlushedConfig(() => desktopApi.removeSubscription(subscription.id))
                               .then((nextConfig) => {
                                 setConfig(nextConfig)
-                                setSaveState('idle')
                               })
                               .catch((error) => setMessage(String(error)))
                           }}
@@ -2589,7 +2546,6 @@ function App() {
                                 event.stopPropagation()
                                 void runWithFlushedConfig(() => desktopApi.setDefaultRoutingItem(item.id)).then((nextConfig) => {
                                   setConfig(nextConfig)
-                                  setSaveState('idle')
                                   setMessage('默认路由集已切换')
                                   setPreviewStale(true)
                                 }).catch((error) => setMessage(String(error)))
@@ -2603,7 +2559,6 @@ function App() {
                                 event.stopPropagation()
                                 void runWithFlushedConfig(() => desktopApi.removeRoutingItem(item.id)).then((nextConfig) => {
                                   setConfig(nextConfig)
-                                  setSaveState('idle')
                                   setMessage('路由集已删除')
                                 }).catch((error) => setMessage(String(error)))
                               }}
@@ -2637,7 +2592,6 @@ function App() {
                           .then(() => desktopApi.importRoutingRules(selectedRouting.id, raw, false))
                           .then((nextConfig) => {
                             setConfig(nextConfig)
-                            setSaveState('idle')
                             setMessage('路由规则已导入')
                             setPreviewStale(true)
                           })
@@ -2682,7 +2636,6 @@ function App() {
                                 if (!selectedRouting) return
                                 void runWithFlushedConfig(() => desktopApi.moveRoutingRule(selectedRouting.id, rule.id, 'up')).then((nextConfig) => {
                                   setConfig(nextConfig)
-                                  setSaveState('idle')
                                 }).catch((error) => setMessage(String(error)))
                               }}
                             >
@@ -2695,7 +2648,6 @@ function App() {
                                 if (!selectedRouting) return
                                 void runWithFlushedConfig(() => desktopApi.moveRoutingRule(selectedRouting.id, rule.id, 'down')).then((nextConfig) => {
                                   setConfig(nextConfig)
-                                  setSaveState('idle')
                                 }).catch((error) => setMessage(String(error)))
                               }}
                             >
