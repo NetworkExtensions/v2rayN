@@ -6,6 +6,7 @@ pub mod core_update;
 pub mod domain;
 pub mod events;
 pub mod http_server;
+pub mod macos_app_bundle;
 pub mod models;
 pub mod network_probe;
 pub mod system_proxy;
@@ -113,6 +114,8 @@ pub fn run() {
             commands::refresh_clash_proxy_provider,
             commands::get_clash_connections,
             commands::test_clash_proxy_delay,
+            commands::resolve_macos_app_bundle,
+            commands::list_applications,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

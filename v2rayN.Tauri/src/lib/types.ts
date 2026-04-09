@@ -106,6 +106,8 @@ export interface RoutingRule {
   domain: string[]
   protocol: string[]
   process: string[]
+  app_display_name?: string | null
+  app_icon?: string | null
 }
 
 export interface RoutingItem {
@@ -256,6 +258,14 @@ export interface ClashConnection {
   host?: string | null
   destination?: string | null
   start?: string | null
+}
+
+export interface AppBundleInfo {
+  display_name: string
+  bundle_identifier: string
+  bundle_path: string
+  process_names: string[]
+  icon_base64?: string | null
 }
 
 export interface ClashProxyProvider {

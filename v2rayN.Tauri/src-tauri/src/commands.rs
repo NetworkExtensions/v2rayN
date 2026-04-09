@@ -939,3 +939,17 @@ fn latest_delay_ms(proxy: Option<&serde_json::Map<String, Value>>) -> Option<u64
 pub fn error_to_string(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
+
+// ── macOS App 解析 ──────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub fn resolve_macos_app_bundle(
+    path: String,
+) -> Result<crate::macos_app_bundle::AppBundleInfo, String> {
+    crate::macos_app_bundle::resolve_app_bundle(&path).map_err(error_to_string)
+}
+
+#[tauri::command]
+pub fn list_applications() -> Result<Vec<crate::macos_app_bundle::AppBundleInfo>, String> {
+    crate::macos_app_bundle::list_applications().map_err(error_to_string)
+}

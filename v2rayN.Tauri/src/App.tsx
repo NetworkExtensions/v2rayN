@@ -3,6 +3,7 @@ import { useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 
 import { desktopApi } from './lib/api'
 import type {
+  AppBundleInfo,
   AppConfig,
   AppStatus,
   ClashConnection,
@@ -27,6 +28,13 @@ type HostRuleMatchType = 'domain' | 'domain_suffix' | 'domain_keyword' | 'ip_cid
 
 interface SimpleRuleDraft {
   target: string
+  action: 'proxy' | 'direct' | 'block'
+  priority: PriorityLevel
+}
+
+interface AppRuleDraft {
+  resolved: AppBundleInfo | null
+  manualTarget: string
   action: 'proxy' | 'direct' | 'block'
   priority: PriorityLevel
 }
@@ -83,7 +91,13 @@ function App() {
   const [lastImportPreview, setLastImportPreview] = useState<ImportPreview | null>(null)
   const [clipboardSuggestion, setClipboardSuggestion] = useState<string>('')
   const [hostRuleDraft, setHostRuleDraft] = useState<HostRuleDraft>({ target: '', action: 'proxy', priority: 'high', matchType: 'domain' })
-  const [appRuleDraft, setAppRuleDraft] = useState<SimpleRuleDraft>({ target: '', action: 'direct', priority: 'normal' })
+  const [appRuleDraft, setAppRuleDraft] = useState<AppRuleDraft>({ resolved: null, manualTarget: '', action: 'direct', priority: 'normal' })
+  const [appDragOver, setAppDragOver] = useState(false)
+  const [appResolving, setAppResolving] = useState(false)
+  const [showAppPicker, setShowAppPicker] = useState(false)
+  const [appPickerList, setAppPickerList] = useState<AppBundleInfo[]>([])
+  const [appPickerLoading, setAppPickerLoading] = useState(false)
+  const [appPickerFilter, setAppPickerFilter] = useState('')
   const [clashProxyGroups, setClashProxyGroups] = useState<ClashProxyGroup[]>([])
   const [clashProxyProviders, setClashProxyProviders] = useState<ClashProxyProvider[]>([])
   const [clashConnections, setClashConnections] = useState<ClashConnection[]>([])
@@ -1108,10 +1122,14 @@ function App() {
   }
 
   function addSimpleRule(kind: SimpleRuleKind) {
-    const draft = kind === 'host' ? hostRuleDraft : appRuleDraft
+    if (kind === 'app') {
+      void addAppRule()
+      return
+    }
+    const draft = hostRuleDraft
     const target = draft.target.trim()
     if (!target) {
-      setMessage(kind === 'host' ? getHostRuleValidationMessage(hostRuleDraft.matchType) : '请填写 App 名称或进程名')
+      setMessage(getHostRuleValidationMessage(hostRuleDraft.matchType))
       return
     }
     if (!activeRoutingItem) {
@@ -1128,19 +1146,15 @@ function App() {
         id: crypto.randomUUID(),
         rule_type: 'all',
         enabled: true,
-        remarks: kind === 'host' ? `网站例外 · ${target}` : `App 例外 · ${target}`,
+        remarks: `网站例外 · ${target}`,
         type_name: '',
         port: '',
         network: '',
         inbound_tag: [],
         outbound_tag: draft.action,
-        ...(
-          kind === 'host'
-            ? buildHostRuleMatcher(target, hostRuleDraft.matchType)
-            : { ip: [], domain: [] }
-        ),
+        ...buildHostRuleMatcher(target, hostRuleDraft.matchType),
         protocol: [],
-        process: kind === 'app' ? [target] : [],
+        process: [],
       }
       if (draft.priority === 'high') {
         routing.rule_set.unshift(rule)
@@ -1150,11 +1164,128 @@ function App() {
       routing.rule_num = routing.rule_set.length
     })
 
-    if (kind === 'host') {
-      setHostRuleDraft({ target: '', action: 'proxy', priority: 'high', matchType: 'domain' })
-    } else {
-      setAppRuleDraft({ target: '', action: 'direct', priority: 'normal' })
+    setHostRuleDraft({ target: '', action: 'proxy', priority: 'high', matchType: 'domain' })
+  }
+
+  async function addAppRule() {
+    const { resolved, manualTarget, action, priority } = appRuleDraft
+    const processNames = resolved?.process_names ?? []
+    const fallbackTarget = manualTarget.trim()
+
+    if (processNames.length === 0 && !fallbackTarget) {
+      setMessage('请先拖入或选择一个 App，或手动填写进程名')
+      return
     }
+    if (!activeRoutingItem) {
+      setMessage('当前没有可用的路由集，请先在高级中初始化路由')
+      return
+    }
+
+    const displayName = resolved?.display_name ?? fallbackTarget
+    const processes = processNames.length > 0 ? processNames : [fallbackTarget]
+
+    updateConfig((nextConfig) => {
+      const routing = nextConfig.routing.items.find((item) => item.id === activeRoutingItem.id)
+      if (!routing) {
+        return
+      }
+      const rule: RoutingRule = {
+        id: crypto.randomUUID(),
+        rule_type: 'all',
+        enabled: true,
+        remarks: `App 例外 · ${displayName}`,
+        type_name: '',
+        port: '',
+        network: '',
+        inbound_tag: [],
+        outbound_tag: action,
+        ip: [],
+        domain: [],
+        protocol: [],
+        process: processes,
+        app_display_name: resolved?.display_name ?? null,
+        app_icon: resolved?.icon_base64 ?? null,
+      }
+      if (priority === 'high') {
+        routing.rule_set.unshift(rule)
+      } else {
+        routing.rule_set.push(rule)
+      }
+      routing.rule_num = routing.rule_set.length
+    })
+
+    setAppRuleDraft({ resolved: null, manualTarget: '', action: 'direct', priority: 'normal' })
+
+    await applyRulesToRunningCore()
+  }
+
+  async function applyRulesToRunningCore() {
+    if (!status?.runtime.running) {
+      return
+    }
+    try {
+      if (status.runtime.core_type === 'mihomo') {
+        await desktopApi.reloadClashConfig()
+        setMessage('规则已添加并已生效（Clash 热重载）')
+      } else {
+        await desktopApi.restartCore()
+        await syncRuntimeStatus()
+        setMessage('规则已添加并已生效（核心已重启）')
+      }
+    } catch (error) {
+      setMessage(`规则已保存，但自动重载失败：${error}。请手动重启核心。`)
+    }
+  }
+
+  async function handleAppDrop(event: React.DragEvent) {
+    event.preventDefault()
+    setAppDragOver(false)
+    const items = Array.from(event.dataTransfer.items)
+    for (const item of items) {
+      if (item.kind === 'file') {
+        const file = item.getAsFile()
+        if (!file) continue
+        const path = (file as unknown as { path?: string }).path ?? file.name
+        if (path.endsWith('.app') || path.includes('.app/')) {
+          const appPath = path.replace(/\/Contents\/.*$/, '').replace(/\/$/, '')
+          await resolveAndSetApp(appPath)
+          return
+        }
+      }
+    }
+    setMessage('请拖入 .app 文件（如 /Applications/ChatGPT.app）')
+  }
+
+  async function resolveAndSetApp(appPath: string) {
+    setAppResolving(true)
+    try {
+      const info = await desktopApi.resolveMacosAppBundle(appPath)
+      setAppRuleDraft((current) => ({ ...current, resolved: info, manualTarget: '' }))
+    } catch (error) {
+      setMessage(`解析 App 失败：${error}`)
+    } finally {
+      setAppResolving(false)
+    }
+  }
+
+  async function handleOpenAppPicker() {
+    setShowAppPicker(true)
+    setAppPickerFilter('')
+    if (appPickerList.length > 0) return
+    setAppPickerLoading(true)
+    try {
+      const list = await desktopApi.listApplications()
+      setAppPickerList(list)
+    } catch (error) {
+      setMessage(`读取应用列表失败：${error}`)
+    } finally {
+      setAppPickerLoading(false)
+    }
+  }
+
+  function handlePickApp(info: AppBundleInfo) {
+    setAppRuleDraft((current) => ({ ...current, resolved: info, manualTarget: '' }))
+    setShowAppPicker(false)
   }
 
   function removeSimpleRule(ruleId: string) {
@@ -1652,7 +1783,7 @@ function App() {
                 >
                   <div className="grid gap-4 md:grid-cols-2">
                   <SummaryStat title="网站例外" value={`${hostRules.length} 条`} description={hostRules[0] ? formatHostRuleSummary(hostRules[0]) : '尚未添加'} />
-                    <SummaryStat title="App 例外" value={`${appRules.length} 条`} description={appRules[0]?.process[0] ?? '尚未添加'} />
+                    <SummaryStat title="App 例外" value={`${appRules.length} 条`} description={appRules[0]?.app_display_name ?? appRules[0]?.process[0] ?? '尚未添加'} />
                   </div>
                 </SectionCard>
               </div>
@@ -1816,7 +1947,7 @@ function App() {
                 <div className="grid gap-4 md:grid-cols-3">
                   <SummaryStat title="默认路由集" value={activeRoutingItem?.remarks ?? '未初始化'} description={activeRoutingItem ? `规则数 ${activeRoutingItem.rule_num}` : '可在高级中初始化'} />
                   <SummaryStat title="网站例外" value={`${hostRules.length} 条`} description={hostRules[0] ? formatHostRuleSummary(hostRules[0]) : '暂时为空'} />
-                  <SummaryStat title="App 例外" value={`${appRules.length} 条`} description={appRules[0]?.process[0] ?? '暂时为空'} />
+                  <SummaryStat title="App 例外" value={`${appRules.length} 条`} description={appRules[0]?.app_display_name ?? appRules[0]?.process[0] ?? '暂时为空'} />
                 </div>
               </SectionCard>
 
@@ -1864,19 +1995,62 @@ function App() {
                 </SectionCard>
 
                 <SectionCard title="App 例外">
-                  <div className="grid gap-4 md:grid-cols-[1fr_180px_160px_auto]">
-                    <Field label="App / 进程名">
-                      <input value={appRuleDraft.target} onChange={(event) => setAppRuleDraft((current) => ({ ...current, target: event.target.value }))} placeholder="Telegram.exe / WeChat" />
-                    </Field>
+                  {/* 拖拽区 + 选择按钮 */}
+                  <div
+                    className={`relative rounded-2xl border-2 border-dashed p-6 text-center transition-colors ${appDragOver ? 'border-blue-400 bg-blue-500/10' : 'border-slate-700 bg-slate-900/40'}`}
+                    onDragOver={(e) => { e.preventDefault(); setAppDragOver(true) }}
+                    onDragLeave={() => setAppDragOver(false)}
+                    onDrop={(e) => void handleAppDrop(e)}
+                  >
+                    {appResolving ? (
+                      <p className="text-sm text-slate-400">正在解析 App...</p>
+                    ) : appRuleDraft.resolved ? (
+                      <div className="flex items-center justify-center gap-3">
+                        {appRuleDraft.resolved.icon_base64 ? (
+                          <img src={appRuleDraft.resolved.icon_base64} alt="" className="h-10 w-10 rounded-lg" />
+                        ) : null}
+                        <div className="text-left">
+                          <p className="font-medium text-slate-100">{appRuleDraft.resolved.display_name}</p>
+                          <p className="text-xs text-slate-500">
+                            匹配 {appRuleDraft.resolved.process_names.length} 个进程：{appRuleDraft.resolved.process_names.join(', ')}
+                          </p>
+                        </div>
+                        <button className="ml-3 text-xs text-slate-500 hover:text-slate-300" onClick={() => setAppRuleDraft((c) => ({ ...c, resolved: null }))}>清除</button>
+                      </div>
+                    ) : (
+                      <div className="space-y-2">
+                        <p className="text-sm text-slate-400">将 .app 拖到这里，或</p>
+                        <div className="flex justify-center gap-2">
+                          <button className="rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200" onClick={() => void handleOpenAppPicker()}>从应用列表选择</button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* 手动填写兜底 */}
+                  {!appRuleDraft.resolved ? (
+                    <div className="mt-3">
+                      <Field label="或手动填写进程名">
+                        <input
+                          value={appRuleDraft.manualTarget}
+                          onChange={(e) => setAppRuleDraft((c) => ({ ...c, manualTarget: e.target.value }))}
+                          placeholder="例如 Telegram / WeChat"
+                        />
+                      </Field>
+                    </div>
+                  ) : null}
+
+                  {/* 动作 + 优先级 + 确认 */}
+                  <div className="mt-3 grid gap-4 md:grid-cols-[180px_160px_auto]">
                     <Field label="动作">
-                      <select value={appRuleDraft.action} onChange={(event) => setAppRuleDraft((current) => ({ ...current, action: event.target.value as SimpleRuleDraft['action'] }))}>
+                      <select value={appRuleDraft.action} onChange={(e) => setAppRuleDraft((c) => ({ ...c, action: e.target.value as AppRuleDraft['action'] }))}>
                         <option value="proxy">走代理</option>
                         <option value="direct">直接连接</option>
                         <option value="block">阻止</option>
                       </select>
                     </Field>
                     <Field label="优先级">
-                      <select value={appRuleDraft.priority} onChange={(event) => setAppRuleDraft((current) => ({ ...current, priority: event.target.value as PriorityLevel }))}>
+                      <select value={appRuleDraft.priority} onChange={(e) => setAppRuleDraft((c) => ({ ...c, priority: e.target.value as PriorityLevel }))}>
                         <option value="high">高</option>
                         <option value="normal">普通</option>
                       </select>
@@ -1885,12 +2059,59 @@ function App() {
                       <ActionButton onClick={() => addSimpleRule('app')}>新增规则</ActionButton>
                     </div>
                   </div>
+
+                  {/* 已有规则列表 */}
                   <div className="mt-4 space-y-3">
-                    {appRules.length === 0 ? <EmptyState title="还没有 App 例外" description="例如：让 `Telegram` 全部走代理，或者让公司办公软件直接连接。" /> : null}
+                    {appRules.length === 0 ? <EmptyState title="还没有 App 例外" description="拖入 App 或从列表选择，让指定应用走代理、直连或阻止。" /> : null}
                     {appRules.map((rule) => (
-                      <SimpleRuleCard key={rule.id} title={rule.process.join(', ')} action={rule.outbound_tag ?? 'proxy'} remarks={rule.remarks ?? ''} onRemove={() => removeSimpleRule(rule.id)} />
+                      <AppRuleCard key={rule.id} rule={rule} onRemove={() => removeSimpleRule(rule.id)} />
                     ))}
                   </div>
+
+                  {/* App 选择弹层 */}
+                  {showAppPicker ? (
+                    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onClick={() => setShowAppPicker(false)}>
+                      <div className="max-h-[70vh] w-full max-w-lg overflow-hidden rounded-2xl border border-slate-700 bg-slate-900 shadow-2xl" onClick={(e) => e.stopPropagation()}>
+                        <div className="flex items-center justify-between border-b border-slate-800 p-4">
+                          <h3 className="text-lg font-semibold text-slate-100">选择应用</h3>
+                          <button className="text-sm text-slate-500 hover:text-slate-300" onClick={() => setShowAppPicker(false)}>关闭</button>
+                        </div>
+                        <div className="border-b border-slate-800 p-3">
+                          <input
+                            placeholder="搜索应用..."
+                            value={appPickerFilter}
+                            onChange={(e) => setAppPickerFilter(e.target.value)}
+                            autoFocus
+                          />
+                        </div>
+                        <div className="max-h-[50vh] overflow-y-auto p-2">
+                          {appPickerLoading ? (
+                            <p className="py-8 text-center text-sm text-slate-400">正在加载应用列表...</p>
+                          ) : (
+                            appPickerList
+                              .filter((app) => {
+                                if (!appPickerFilter) return true
+                                const q = appPickerFilter.toLowerCase()
+                                return app.display_name.toLowerCase().includes(q) || app.bundle_identifier.toLowerCase().includes(q)
+                              })
+                              .map((app) => (
+                                <button
+                                  key={app.bundle_path}
+                                  className="flex w-full items-center gap-3 rounded-xl p-3 text-left hover:bg-slate-800"
+                                  onClick={() => handlePickApp(app)}
+                                >
+                                  {app.icon_base64 ? <img src={app.icon_base64} alt="" className="h-8 w-8 rounded-lg" /> : <div className="h-8 w-8 rounded-lg bg-slate-700" />}
+                                  <div>
+                                    <p className="text-sm font-medium text-slate-100">{app.display_name}</p>
+                                    <p className="text-xs text-slate-500">{app.process_names.join(', ')}</p>
+                                  </div>
+                                </button>
+                              ))
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  ) : null}
                 </SectionCard>
               </div>
             </div>
@@ -3115,6 +3336,31 @@ function SimpleRuleCard({
       </div>
       <div className="flex items-center gap-3">
         <StatusPill label={formatRuleAction(action)} tone={action === 'block' ? 'warning' : 'success'} />
+        <button className="rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200" onClick={onRemove}>
+          删除
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function AppRuleCard({ rule, onRemove }: { rule: RoutingRule; onRemove: () => void }) {
+  const title = rule.app_display_name || rule.process.join(', ')
+  const subtitle = rule.app_display_name
+    ? `${rule.process.length} 个进程：${rule.process.join(', ')}`
+    : rule.remarks ?? ''
+
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
+      <div className="flex items-center gap-3">
+        {rule.app_icon ? <img src={rule.app_icon} alt="" className="h-8 w-8 rounded-lg" /> : null}
+        <div>
+          <p className="font-medium text-slate-100">{title}</p>
+          <p className="mt-1 text-xs text-slate-500">{subtitle}</p>
+        </div>
+      </div>
+      <div className="flex items-center gap-3">
+        <StatusPill label={formatRuleAction(rule.outbound_tag ?? 'proxy')} tone={rule.outbound_tag === 'block' ? 'warning' : 'success'} />
         <button className="rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200" onClick={onRemove}>
           删除
         </button>

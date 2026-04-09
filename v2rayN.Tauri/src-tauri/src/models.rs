@@ -284,6 +284,8 @@ pub struct RoutingRule {
     pub domain: Vec<String>,
     pub protocol: Vec<String>,
     pub process: Vec<String>,
+    pub app_display_name: Option<String>,
+    pub app_icon: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

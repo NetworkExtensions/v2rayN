@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 
 import type {
+  AppBundleInfo,
   AppConfig,
   AppStatus,
   BackgroundTaskEvent,
@@ -281,6 +282,15 @@ export const desktopApi = {
     ? (groupName: string) => invoke<number>('test_clash_proxy_delay', { groupName })
     : (groupName: string) =>
         httpGet<{ delay: number }>(`/api/clash/proxy-delay/${encodeURIComponent(groupName)}`).then((r) => r.delay),
+
+  // macOS App 解析
+  resolveMacosAppBundle: isTauri
+    ? (path: string) => invoke<AppBundleInfo>('resolve_macos_app_bundle', { path })
+    : (path: string) => httpPost<AppBundleInfo>('/api/macos/resolve-app', { path }),
+
+  listApplications: isTauri
+    ? () => invoke<AppBundleInfo[]>('list_applications')
+    : () => httpGet<AppBundleInfo[]>('/api/macos/applications'),
 
   // 事件监听
   onCoreLog: isTauri

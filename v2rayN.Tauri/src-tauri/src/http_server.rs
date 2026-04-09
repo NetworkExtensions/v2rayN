@@ -112,6 +112,9 @@ pub async fn serve(state: SharedState, port: u16) {
         .route("/api/clash/providers/{name}/refresh", post(handle_clash_refresh_provider))
         .route("/api/clash/rule-mode", post(handle_clash_rule_mode))
         .route("/api/clash/reload", post(handle_clash_reload))
+        // macOS App 解析
+        .route("/api/macos/resolve-app", post(handle_resolve_app_bundle))
+        .route("/api/macos/applications", get(handle_list_applications))
         // WebSocket 事件流
         .route("/api/events", get(handle_ws_upgrade))
         .layer(cors)
@@ -797,4 +800,33 @@ async fn handle_clash_reload(State(state): State<SharedState>) -> ApiResult<Valu
             .map_err(|e| e.to_string())?;
         Ok::<_, String>(json!({ "ok": true }))
     })
+}
+
+// ── macOS App 解析 ──────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct ResolveAppBody {
+    path: String,
+}
+
+async fn handle_resolve_app_bundle(
+    Json(body): Json<ResolveAppBody>,
+) -> ApiResult<crate::macos_app_bundle::AppBundleInfo> {
+    spawn_blocking(move || {
+        crate::macos_app_bundle::resolve_app_bundle(&body.path).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(ApiError::from)?
+    .map_err(ApiError::from)
+    .map(Json)
+}
+
+async fn handle_list_applications() -> ApiResult<Vec<crate::macos_app_bundle::AppBundleInfo>> {
+    spawn_blocking(move || {
+        crate::macos_app_bundle::list_applications().map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(ApiError::from)?
+    .map_err(ApiError::from)
+    .map(Json)
 }
